@@ -239,29 +239,34 @@ namespace
       }
     }
 
-    // define platform-specific strings
-#if defined(_WIN32) || defined(__CYGWIN__)
-    const std::string sep = "\\";
-#else
-    const std::string sep = "/";
-#endif
-
-    // try to open the ${EXECDIR}/plugin directory
-    // ${EXECDIR} is the directory containing the simulate binary itself
     const std::string executable_dir = getExecutableDir();
     if (executable_dir.empty())
     {
       return;
     }
 
-    const std::string plugin_dir = getExecutableDir() + sep + MUJOCO_PLUGIN_DIR;
-    mj_loadAllPluginLibraries(
-        plugin_dir.c_str(), +[](const char *filename, int first, int count)
-                            {
-        std::printf("Plugins registered by library '%s':\n", filename);
-        for (int i = first; i < first + count; ++i) {
-          std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
-        } });
+    const std::filesystem::path exec_dir(executable_dir);
+    const std::vector<std::filesystem::path> plugin_dirs = {
+        exec_dir / MUJOCO_PLUGIN_DIR,
+        exec_dir.parent_path() / "mujoco" / "bin" / MUJOCO_PLUGIN_DIR,
+    };
+
+    for (const auto& plugin_dir : plugin_dirs)
+    {
+      if (!std::filesystem::exists(plugin_dir))
+      {
+        continue;
+      }
+
+      mj_loadAllPluginLibraries(
+          plugin_dir.c_str(), +[](const char *filename, int first, int count)
+                              {
+          std::printf("Plugins registered by library '%s':\n", filename);
+          for (int i = first; i < first + count; ++i) {
+            std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
+          } });
+      return;
+    }
   }
 
   //------------------------------------------- simulation -------------------------------------------
