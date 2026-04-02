@@ -599,7 +599,9 @@ void *UnitreeSdk2BridgeThread(void *arg)
   param::config.band_attached_link = 6 * body_id;
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
-  if (m->nu > NUM_MOTOR_IDL_GO) {
+  if (param::config.robot == "r1") {
+    interface = std::make_unique<R1Bridge>(m, d);
+  } else if (m->nu > NUM_MOTOR_IDL_GO) {
     interface = std::make_unique<G1Bridge>(m, d);
   } else {
     interface = std::make_unique<Go2Bridge>(m, d);

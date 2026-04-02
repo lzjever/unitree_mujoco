@@ -6,10 +6,15 @@
 #include <unitree/robot/channel/channel_subscriber.hpp>
 #include <unitree/dds_wrapper/robots/go2/go2.h>
 #include <unitree/dds_wrapper/robots/g1/g1.h>
+#include <unitree/dds_wrapper/common/crc.h>
 #include <unitree/idl/hg/BmsState_.hpp>
 #include <unitree/idl/hg/IMUState_.hpp>
+#include <unitree/idl/hg/LowCmd_.hpp>
+#include <unitree/idl/hg/LowState_.hpp>
 
+#include <array>
 #include <iostream>
+#include <mutex>
 
 #include "param.h"
 #include "physics_joystick.h"
@@ -90,61 +95,35 @@ protected:
 
     std::shared_ptr<unitree::common::UnitreeJoystick> joystick = nullptr;
 
+    int find_sensor_adr(std::initializer_list<const char*> names) const
+    {
+        for (const char* name : names) {
+            int sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, name);
+            if (sensor_id >= 0) {
+                return mj_model_->sensor_adr[sensor_id];
+            }
+        }
+        return -1;
+    }
+
     void _check_sensor()
     {
         num_motor_ = mj_model_->nu;
         dim_motor_sensor_ = MOTOR_SENSOR_NUM * num_motor_;
-    
-        // Find sensor addresses by name
-        int sensor_id = -1;
-        
-        // IMU quaternion
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "imu_quat");
-        if (sensor_id >= 0) {
-            imu_quat_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
-        
-        // IMU gyroscope
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "imu_gyro");
-        if (sensor_id >= 0) {
-            imu_gyro_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
-        
-        // IMU accelerometer
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "imu_acc");
-        if (sensor_id >= 0) {
-            imu_acc_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
-        
-        // Frame position
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "frame_pos");
-        if (sensor_id >= 0) {
-            frame_pos_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
-        
-        // Frame velocity
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "frame_vel");
-        if (sensor_id >= 0) {
-            frame_vel_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
 
-        // Secondary IMU quaternion
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "secondary_imu_quat");
-        if (sensor_id >= 0) {
-            secondary_imu_quat_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
+        // Primary IMU / state estimator signals. For R1 we use pelvis signals.
+        imu_quat_adr_ = find_sensor_adr({"imu_quat", "orientation_pelvis"});
+        imu_gyro_adr_ = find_sensor_adr({"imu_gyro", "gyro_pelvis"});
+        imu_acc_adr_ = find_sensor_adr({"imu_acc", "accelerometer_pelvis"});
 
-        // Secondary IMU gyroscope
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "secondary_imu_gyro");
-        if (sensor_id >= 0) {
-            secondary_imu_gyro_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
+        // Optional base position / velocity outputs.
+        frame_pos_adr_ = find_sensor_adr({"frame_pos"});
+        frame_vel_adr_ = find_sensor_adr({"frame_vel", "global_linvel_pelvis"});
 
-        // Secondary IMU accelerometer
-        sensor_id = mj_name2id(mj_model_, mjOBJ_SENSOR, "secondary_imu_acc");
-        if (sensor_id >= 0) {
-            secondary_imu_acc_adr_ = mj_model_->sensor_adr[sensor_id];
-        }
+        // Secondary IMU. For R1 we use torso signals.
+        secondary_imu_quat_adr_ = find_sensor_adr({"secondary_imu_quat", "orientation_torso"});
+        secondary_imu_gyro_adr_ = find_sensor_adr({"secondary_imu_gyro", "gyro_torso"});
+        secondary_imu_acc_adr_ = find_sensor_adr({"secondary_imu_acc", "accelerometer_torso"});
     }
 };
 
@@ -320,4 +299,137 @@ public:
     using IMUState_t = unitree::robot::RealTimePublisher<unitree_hg::msg::dds_::IMUState_>;
     std::unique_ptr<BmsState_t> bmsstate;
     std::unique_ptr<IMUState_t> secondary_imustate;
+};
+
+class R1Bridge : public UnitreeSDK2BridgeBase
+{
+public:
+    R1Bridge(mjModel *model, mjData *data) : UnitreeSDK2BridgeBase(model, data)
+    {
+        lowcmd_subscriber_ = std::make_unique<unitree::robot::ChannelSubscriber<unitree_hg::msg::dds_::LowCmd_>>("rt/lowcmd");
+        lowstate_publisher_ = std::make_unique<unitree::robot::ChannelPublisher<unitree_hg::msg::dds_::LowState_>>("rt/lowstate");
+        secondary_imustate_publisher_ = std::make_unique<unitree::robot::ChannelPublisher<unitree_hg::msg::dds_::IMUState_>>("rt/secondary_imu");
+        highstate_publisher_ = std::make_unique<unitree::robot::ChannelPublisher<unitree_go::msg::dds_::SportModeState_>>("rt/sportmodestate");
+    }
+
+    void start() override
+    {
+        lowcmd_subscriber_->InitChannel(std::bind(&R1Bridge::LowCmdHandler, this, std::placeholders::_1), 1);
+        lowstate_publisher_->InitChannel();
+        secondary_imustate_publisher_->InitChannel();
+        highstate_publisher_->InitChannel();
+
+        thread_ = std::make_shared<unitree::common::RecurrentThread>(
+            "r1_bridge", UT_CPU_ID_NONE, 1000, [this]() { this->run(); });
+    }
+
+private:
+    static constexpr int kR1MotorCount = 26;
+    static constexpr std::array<int, kR1MotorCount> kJointIdxInIdl = {
+        0, 1, 2, 3, 4, 5,
+        6, 7, 8, 9, 10, 11,
+        12, 13,
+        15, 16, 17, 18, 19,
+        22, 23, 24, 25, 26,
+        29, 30
+    };
+
+    void LowCmdHandler(const void* message)
+    {
+        std::lock_guard<std::mutex> lock(lowcmd_mutex_);
+        latest_lowcmd_ = *static_cast<const unitree_hg::msg::dds_::LowCmd_*>(message);
+    }
+
+    void fill_imu_state(unitree_hg::msg::dds_::IMUState_& imu_state, int quat_adr, int gyro_adr, int acc_adr)
+    {
+        if (quat_adr >= 0) {
+            imu_state.quaternion()[0] = mj_data_->sensordata[quat_adr + 0];
+            imu_state.quaternion()[1] = mj_data_->sensordata[quat_adr + 1];
+            imu_state.quaternion()[2] = mj_data_->sensordata[quat_adr + 2];
+            imu_state.quaternion()[3] = mj_data_->sensordata[quat_adr + 3];
+
+            double w = imu_state.quaternion()[0];
+            double x = imu_state.quaternion()[1];
+            double y = imu_state.quaternion()[2];
+            double z = imu_state.quaternion()[3];
+
+            imu_state.rpy()[0] = atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+            imu_state.rpy()[1] = asin(2 * (w * y - z * x));
+            imu_state.rpy()[2] = atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+        }
+
+        if (gyro_adr >= 0) {
+            imu_state.gyroscope()[0] = mj_data_->sensordata[gyro_adr + 0];
+            imu_state.gyroscope()[1] = mj_data_->sensordata[gyro_adr + 1];
+            imu_state.gyroscope()[2] = mj_data_->sensordata[gyro_adr + 2];
+        }
+
+        if (acc_adr >= 0) {
+            imu_state.accelerometer()[0] = mj_data_->sensordata[acc_adr + 0];
+            imu_state.accelerometer()[1] = mj_data_->sensordata[acc_adr + 1];
+            imu_state.accelerometer()[2] = mj_data_->sensordata[acc_adr + 2];
+        }
+    }
+
+    void run()
+    {
+        if (!mj_data_) return;
+
+        unitree_hg::msg::dds_::LowCmd_ lowcmd_msg;
+        {
+            std::lock_guard<std::mutex> lock(lowcmd_mutex_);
+            lowcmd_msg = latest_lowcmd_;
+        }
+
+        for (int i = 0; i < num_motor_ && i < kR1MotorCount; ++i) {
+            const auto& motor_cmd = lowcmd_msg.motor_cmd()[kJointIdxInIdl[i]];
+            mj_data_->ctrl[i] = motor_cmd.tau() +
+                                motor_cmd.kp() * (motor_cmd.q() - mj_data_->sensordata[i]) +
+                                motor_cmd.kd() * (motor_cmd.dq() - mj_data_->sensordata[i + num_motor_]);
+        }
+
+        unitree_hg::msg::dds_::LowState_ lowstate_msg;
+        for (int i = 0; i < num_motor_ && i < kR1MotorCount; ++i) {
+            auto& motor_state = lowstate_msg.motor_state()[kJointIdxInIdl[i]];
+            motor_state.q() = mj_data_->sensordata[i];
+            motor_state.dq() = mj_data_->sensordata[i + num_motor_];
+            motor_state.tau_est() = mj_data_->sensordata[i + 2 * num_motor_];
+        }
+
+        fill_imu_state(lowstate_msg.imu_state(), imu_quat_adr_, imu_gyro_adr_, imu_acc_adr_);
+        lowstate_msg.tick() = std::round(mj_data_->time / 1e-3);
+
+        if (joystick) {
+            joystick->update();
+            auto data = joystick->combine();
+            memcpy(&lowstate_msg.wireless_remote()[0], &data, sizeof(unitree::common::REMOTE_DATA_RX));
+        }
+
+        lowstate_msg.crc() = crc32_core(reinterpret_cast<uint32_t*>(&lowstate_msg), (sizeof(lowstate_msg) >> 2) - 1);
+        lowstate_publisher_->Write(lowstate_msg);
+
+        if (secondary_imu_quat_adr_ >= 0 || secondary_imu_gyro_adr_ >= 0 || secondary_imu_acc_adr_ >= 0) {
+            unitree_hg::msg::dds_::IMUState_ torso_imu_msg;
+            fill_imu_state(torso_imu_msg, secondary_imu_quat_adr_, secondary_imu_gyro_adr_, secondary_imu_acc_adr_);
+            secondary_imustate_publisher_->Write(torso_imu_msg);
+        }
+
+        unitree_go::msg::dds_::SportModeState_ highstate_msg;
+        highstate_msg.position()[0] = static_cast<float>(mj_data_->qpos[0]);
+        highstate_msg.position()[1] = static_cast<float>(mj_data_->qpos[1]);
+        highstate_msg.position()[2] = static_cast<float>(mj_data_->qpos[2]);
+        highstate_msg.velocity()[0] = static_cast<float>(mj_data_->qvel[0]);
+        highstate_msg.velocity()[1] = static_cast<float>(mj_data_->qvel[1]);
+        highstate_msg.velocity()[2] = static_cast<float>(mj_data_->qvel[2]);
+        highstate_msg.yaw_speed() = static_cast<float>(mj_data_->qvel[5]);
+        highstate_publisher_->Write(highstate_msg);
+    }
+
+    std::unique_ptr<unitree::robot::ChannelSubscriber<unitree_hg::msg::dds_::LowCmd_>> lowcmd_subscriber_;
+    std::unique_ptr<unitree::robot::ChannelPublisher<unitree_hg::msg::dds_::LowState_>> lowstate_publisher_;
+    std::unique_ptr<unitree::robot::ChannelPublisher<unitree_hg::msg::dds_::IMUState_>> secondary_imustate_publisher_;
+    std::unique_ptr<unitree::robot::ChannelPublisher<unitree_go::msg::dds_::SportModeState_>> highstate_publisher_;
+    unitree_hg::msg::dds_::LowCmd_ latest_lowcmd_;
+    std::mutex lowcmd_mutex_;
+    unitree::common::RecurrentThreadPtr thread_;
 };
