@@ -25,6 +25,7 @@ inline struct SimulationConfig
 
     int enable_elastic_band;
     int band_attached_link = 0;
+    double sim_dt = 0.0;
 
     void load_from_yaml(const std::string &filename)
     {
@@ -41,6 +42,9 @@ inline struct SimulationConfig
             joystick_bits = cfg["joystick_bits"].as<int>();
             print_scene_information = cfg["print_scene_information"].as<int>();
             enable_elastic_band = cfg["enable_elastic_band"].as<int>();
+            if (cfg["sim_dt"]) {
+                sim_dt = cfg["sim_dt"].as<double>();
+            }
         }
         catch(const std::exception& e)
         {
@@ -63,6 +67,7 @@ inline po::variables_map helper(int argc, char** argv)
         ("network,n", po::value<std::string>(&config.interface), "DDS network interface; -n eth0")
         ("robot,r", po::value<std::string>(&config.robot), "Robot type; -r go2")
         ("scene,s", po::value<std::filesystem::path>(&config.robot_scene), "Robot scene file; -s scene_terrain.xml")
+        ("sim_dt", po::value<double>(&config.sim_dt), "Override MuJoCo timestep after loading XML; --sim_dt 0.001")
     ;
 
     po::variables_map vm;

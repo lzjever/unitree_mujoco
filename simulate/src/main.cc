@@ -318,6 +318,12 @@ namespace
       return nullptr;
     }
 
+    if (param::config.sim_dt > 0.0)
+    {
+      mnew->opt.timestep = param::config.sim_dt;
+      std::printf("Override MuJoCo timestep with sim_dt=%.6f s\n", param::config.sim_dt);
+    }
+
     // compiler warning: print and pause
     if (loadError[0])
     {
