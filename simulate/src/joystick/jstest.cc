@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include "joystick.h"
@@ -8,29 +9,33 @@
 #define MIN_AXES_VALUE -32768
 using namespace std;
 
-typedef union
+namespace
 {
-  struct
+constexpr uint16_t kR1Bit = 1u << 0;
+constexpr uint16_t kL1Bit = 1u << 1;
+constexpr uint16_t kStartBit = 1u << 2;
+constexpr uint16_t kSelectBit = 1u << 3;
+constexpr uint16_t kR2Bit = 1u << 4;
+constexpr uint16_t kL2Bit = 1u << 5;
+constexpr uint16_t kF1Bit = 1u << 6;
+constexpr uint16_t kF2Bit = 1u << 7;
+constexpr uint16_t kABit = 1u << 8;
+constexpr uint16_t kBBit = 1u << 9;
+constexpr uint16_t kXBit = 1u << 10;
+constexpr uint16_t kYBit = 1u << 11;
+constexpr uint16_t kUpBit = 1u << 12;
+constexpr uint16_t kRightBit = 1u << 13;
+constexpr uint16_t kDownBit = 1u << 14;
+constexpr uint16_t kLeftBit = 1u << 15;
+
+inline void SetBit(uint16_t& value, uint16_t mask, bool enabled)
+{
+  if (enabled)
   {
-    uint8_t R1 : 1;
-    uint8_t L1 : 1;
-    uint8_t start : 1;
-    uint8_t select : 1;
-    uint8_t R2 : 1;
-    uint8_t L2 : 1;
-    uint8_t F1 : 1;
-    uint8_t F2 : 1;
-    uint8_t A : 1;
-    uint8_t B : 1;
-    uint8_t X : 1;
-    uint8_t Y : 1;
-    uint8_t up : 1;
-    uint8_t right : 1;
-    uint8_t down : 1;
-    uint8_t left : 1;
-  } components;
-  uint16_t value;
-} xKeySwitchUnion;
+    value |= mask;
+  }
+}
+}  // namespace
 
 int main(int argc, char **argv)
 {
@@ -44,7 +49,6 @@ int main(int argc, char **argv)
     exit(1);
   }
 
-  xKeySwitchUnion unitree_key;
   map<string, int> AxisId =
       {
           {"LX", 0}, // Left stick axis x
@@ -75,24 +79,25 @@ int main(int argc, char **argv)
     // Attempt to sample an event from the joystick
     joystick.getState();
 
-    unitree_key.components.R1 = joystick.button_[ButtonId["RB"]];
-    unitree_key.components.L1 = joystick.button_[ButtonId["LB"]];
-    unitree_key.components.start = joystick.button_[ButtonId["START"]];
-    unitree_key.components.select = joystick.button_[ButtonId["SELECT"]];
-    unitree_key.components.R2 = (joystick.axis_[AxisId["RT"]] > 0);
-    unitree_key.components.L2 = (joystick.axis_[AxisId["LT"]] > 0);
-    unitree_key.components.F1 = 0;
-    unitree_key.components.F2 = 0;
-    unitree_key.components.A = joystick.button_[ButtonId["A"]];
-    unitree_key.components.B = joystick.button_[ButtonId["B"]];
-    unitree_key.components.X = joystick.button_[ButtonId["X"]];
-    unitree_key.components.Y = joystick.button_[ButtonId["Y"]];
-    unitree_key.components.up = (joystick.axis_[AxisId["DY"]] < 0);
-    unitree_key.components.right = (joystick.axis_[AxisId["DX"]] > 0);
-    unitree_key.components.down = (joystick.axis_[AxisId["DY"]] > 0);
-    unitree_key.components.left = (joystick.axis_[AxisId["DX"]] < 0);
+    uint16_t unitree_key = 0;
+    SetBit(unitree_key, kR1Bit, joystick.button_[ButtonId["RB"]]);
+    SetBit(unitree_key, kL1Bit, joystick.button_[ButtonId["LB"]]);
+    SetBit(unitree_key, kStartBit, joystick.button_[ButtonId["START"]]);
+    SetBit(unitree_key, kSelectBit, joystick.button_[ButtonId["SELECT"]]);
+    SetBit(unitree_key, kR2Bit, joystick.axis_[AxisId["RT"]] > 0);
+    SetBit(unitree_key, kL2Bit, joystick.axis_[AxisId["LT"]] > 0);
+    SetBit(unitree_key, kF1Bit, false);
+    SetBit(unitree_key, kF2Bit, false);
+    SetBit(unitree_key, kABit, joystick.button_[ButtonId["A"]]);
+    SetBit(unitree_key, kBBit, joystick.button_[ButtonId["B"]]);
+    SetBit(unitree_key, kXBit, joystick.button_[ButtonId["X"]]);
+    SetBit(unitree_key, kYBit, joystick.button_[ButtonId["Y"]]);
+    SetBit(unitree_key, kUpBit, joystick.axis_[AxisId["DY"]] < 0);
+    SetBit(unitree_key, kRightBit, joystick.axis_[AxisId["DX"]] > 0);
+    SetBit(unitree_key, kDownBit, joystick.axis_[AxisId["DY"]] > 0);
+    SetBit(unitree_key, kLeftBit, joystick.axis_[AxisId["DX"]] < 0);
 
-    cout << unitree_key.value << endl;
+    cout << unitree_key << endl;
 
     // Restrict rate
     usleep(10000);
