@@ -622,7 +622,7 @@ void *UnitreeSdk2BridgeThread(void *arg)
   }
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
-  if (param::config.robot == "r1" || param::config.robot == "et1_v1") {
+  if (param::config.robot == "r1" || param::config.robot == "et1_v1" || param::config.robot == "tdf_ET1") {
     interface = std::make_unique<R1Bridge>(m, d);
   } else if (m->nu > NUM_MOTOR_IDL_GO) {
     interface = std::make_unique<G1Bridge>(m, d);
