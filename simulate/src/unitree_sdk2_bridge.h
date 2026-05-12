@@ -325,7 +325,7 @@ public:
 
 private:
     static constexpr int kR1MotorCount = 26;
-    static constexpr std::array<int, kR1MotorCount> kJointIdxInIdl = {
+    static constexpr std::array<int, kR1MotorCount> kR1JointIdxInIdl = {
         0, 1, 2, 3, 4, 5,
         6, 7, 8, 9, 10, 11,
         12, 13,
@@ -333,6 +333,20 @@ private:
         22, 23, 24, 25, 26,
         29, 30
     };
+    static constexpr std::array<int, kR1MotorCount> kEt1V1JointIdxInIdl = {
+        0, 1, 2, 3, 4, 5,
+        6, 7, 8, 9, 10, 11,
+        12, 13,
+        29, 30,
+        15, 16, 17, 18, 19,
+        22, 23, 24, 25, 26
+    };
+
+    int idl_slot(int motor_index) const
+    {
+        const auto& map = param::config.robot == "et1_v1" ? kEt1V1JointIdxInIdl : kR1JointIdxInIdl;
+        return map[motor_index];
+    }
 
     void LowCmdHandler(const void* message)
     {
@@ -382,7 +396,7 @@ private:
         }
 
         for (int i = 0; i < num_motor_ && i < kR1MotorCount; ++i) {
-            const auto& motor_cmd = lowcmd_msg.motor_cmd()[kJointIdxInIdl[i]];
+            const auto& motor_cmd = lowcmd_msg.motor_cmd()[idl_slot(i)];
             mj_data_->ctrl[i] = motor_cmd.tau() +
                                 motor_cmd.kp() * (motor_cmd.q() - mj_data_->sensordata[i]) +
                                 motor_cmd.kd() * (motor_cmd.dq() - mj_data_->sensordata[i + num_motor_]);
@@ -390,7 +404,7 @@ private:
 
         unitree_hg::msg::dds_::LowState_ lowstate_msg;
         for (int i = 0; i < num_motor_ && i < kR1MotorCount; ++i) {
-            auto& motor_state = lowstate_msg.motor_state()[kJointIdxInIdl[i]];
+            auto& motor_state = lowstate_msg.motor_state()[idl_slot(i)];
             motor_state.q() = mj_data_->sensordata[i];
             motor_state.dq() = mj_data_->sensordata[i + num_motor_];
             motor_state.tau_est() = mj_data_->sensordata[i + 2 * num_motor_];

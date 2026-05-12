@@ -598,14 +598,31 @@ void *UnitreeSdk2BridgeThread(void *arg)
   unitree::robot::ChannelFactory::Instance()->Init(param::config.domain_id, param::config.interface);
 
 
-  int body_id = mj_name2id(m, mjOBJ_BODY, "torso_link");
-  if (body_id < 0) {
-    body_id = mj_name2id(m, mjOBJ_BODY, "base_link");
+  int body_id = -1;
+  const std::vector<std::string> band_body_candidates = {
+    "head_pitch_link",
+    "head_yaw_link",
+    "torso_link",
+    "base_link",
+    "pelvis_link",
+    "pelvis",
+  };
+  for (const auto& body_name : band_body_candidates) {
+    body_id = mj_name2id(m, mjOBJ_BODY, body_name.c_str());
+    if (body_id >= 0) {
+      std::cout << "Elastic band attached to " << body_name << std::endl;
+      break;
+    }
   }
-  param::config.band_attached_link = 6 * body_id;
+  if (body_id >= 0) {
+    param::config.band_attached_link = 6 * body_id;
+  } else if (param::config.enable_elastic_band == 1) {
+    std::cerr << "Elastic band disabled: no suitable attachment body found." << std::endl;
+    param::config.enable_elastic_band = 0;
+  }
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
-  if (param::config.robot == "r1") {
+  if (param::config.robot == "r1" || param::config.robot == "et1_v1") {
     interface = std::make_unique<R1Bridge>(m, d);
   } else if (m->nu > NUM_MOTOR_IDL_GO) {
     interface = std::make_unique<G1Bridge>(m, d);
