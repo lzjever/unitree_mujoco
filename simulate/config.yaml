@@ -1,5 +1,5 @@
 robot: "tdf_ET1"  # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1", "r1", "et1_v1", "tdf_ET1"
-robot_scene: "scene.xml" # Robot scene, /unitree_robots/[robot]/scene.xml 
+robot_scene: "scene_foot_mesh_carpet.xml" # Robot scene, /unitree_robots/[robot]/scene.xml 
 
 domain_id: 0  # Domain id
 interface: "lo" # Interface 
