@@ -15,6 +15,8 @@
 #include <array>
 #include <iostream>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "param.h"
 #include "physics_joystick.h"
@@ -94,6 +96,7 @@ protected:
     int secondary_imu_acc_adr_ = -1;
 
     std::shared_ptr<unitree::common::UnitreeJoystick> joystick = nullptr;
+    std::vector<double> motor_sensor_offsets_;
 
     int find_sensor_adr(std::initializer_list<const char*> names) const
     {
@@ -110,6 +113,26 @@ protected:
     {
         num_motor_ = mj_model_->nu;
         dim_motor_sensor_ = MOTOR_SENSOR_NUM * num_motor_;
+        motor_sensor_offsets_.assign(num_motor_, 0.0);
+        for (int i = 0; i < num_motor_; ++i) {
+            const char* actuator_name = mj_id2name(mj_model_, mjOBJ_ACTUATOR, i);
+            if (!actuator_name) {
+                continue;
+            }
+            const std::string name(actuator_name);
+            for (const auto& item : param::config.motor_sensor_offsets) {
+                for (const auto& filter : item.name_filters) {
+                    if (!filter.empty() && name.find(filter) != std::string::npos) {
+                        motor_sensor_offsets_[i] = item.offset;
+                    }
+                }
+            }
+            if (std::abs(motor_sensor_offsets_[i]) > 1e-9) {
+                std::cout << "Motor sensor offset: " << actuator_name
+                          << " reports q_actual - (" << motor_sensor_offsets_[i]
+                          << ")" << std::endl;
+            }
+        }
 
         // Primary IMU / state estimator signals. For R1 we use pelvis signals.
         imu_quat_adr_ = find_sensor_adr({"imu_quat", "orientation_pelvis"});
@@ -124,6 +147,14 @@ protected:
         secondary_imu_quat_adr_ = find_sensor_adr({"secondary_imu_quat", "orientation_torso"});
         secondary_imu_gyro_adr_ = find_sensor_adr({"secondary_imu_gyro", "gyro_torso"});
         secondary_imu_acc_adr_ = find_sensor_adr({"secondary_imu_acc", "accelerometer_torso"});
+    }
+
+    double reported_motor_q(int motor_index) const
+    {
+        const double offset = motor_index < static_cast<int>(motor_sensor_offsets_.size())
+                                  ? motor_sensor_offsets_[motor_index]
+                                  : 0.0;
+        return mj_data_->sensordata[motor_index] - offset;
     }
 };
 
@@ -160,7 +191,7 @@ public:
             for(int i(0); i<num_motor_; i++) {
                 auto & m = lowcmd->msg_.motor_cmd()[i];
                 mj_data_->ctrl[i] = m.tau() +
-                                    m.kp() * (m.q() - mj_data_->sensordata[i]) +
+                                    m.kp() * (m.q() - reported_motor_q(i)) +
                                     m.kd() * (m.dq() - mj_data_->sensordata[i + num_motor_]);
             }
         }
@@ -168,7 +199,7 @@ public:
         // lowstate
         if(lowstate->trylock()) {
             for(int i(0); i<num_motor_; i++) {
-                lowstate->msg_.motor_state()[i].q() = mj_data_->sensordata[i];
+                lowstate->msg_.motor_state()[i].q() = reported_motor_q(i);
                 lowstate->msg_.motor_state()[i].dq() = mj_data_->sensordata[i + num_motor_];
                 lowstate->msg_.motor_state()[i].tau_est() = mj_data_->sensordata[i + 2 * num_motor_];
             }
@@ -411,14 +442,14 @@ private:
         for (int i = 0; i < num_motor_ && i < kR1MotorCount; ++i) {
             const auto& motor_cmd = lowcmd_msg.motor_cmd()[idl_slot(i)];
             mj_data_->ctrl[i] = motor_cmd.tau() +
-                                motor_cmd.kp() * (motor_cmd.q() - mj_data_->sensordata[i]) +
+                                motor_cmd.kp() * (motor_cmd.q() - reported_motor_q(i)) +
                                 motor_cmd.kd() * (motor_cmd.dq() - mj_data_->sensordata[i + num_motor_]);
         }
 
         unitree_hg::msg::dds_::LowState_ lowstate_msg;
         for (int i = 0; i < num_motor_ && i < kR1MotorCount; ++i) {
             auto& motor_state = lowstate_msg.motor_state()[idl_slot(i)];
-            motor_state.q() = mj_data_->sensordata[i];
+            motor_state.q() = reported_motor_q(i);
             motor_state.dq() = mj_data_->sensordata[i + num_motor_];
             motor_state.tau_est() = mj_data_->sensordata[i + 2 * num_motor_];
         }

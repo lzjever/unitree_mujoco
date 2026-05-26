@@ -1,5 +1,6 @@
 robot: "tdf_ET1"  # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1", "r1", "et1_v1", "tdf_ET1"
-robot_scene: "scene_foot_mesh_carpet.xml" # Robot scene, /unitree_robots/[robot]/scene.xml 
+robot_scene: "scene_foot_mesh_carpet.xml" # Robot scene, /unitree_robots/[robot]/scene.xml
+# robot_scene: "scene.xml"
 
 domain_id: 0  # Domain id
 interface: "lo" # Interface 
@@ -14,3 +15,26 @@ print_scene_information: 1 # Print link, joint and sensors information of robot
 enable_elastic_band: 1 # Virtual spring band, used for lifting h1
 
 sim_dt: 0.001  # Override MuJoCo physics timestep after loading XML
+
+# Joint friction / damping simulation. Kept conservative so [2] Velocity remains a baseline check.
+enable_joint_dynamics_scaling: 1
+joint_damping_scale: 1.8
+joint_frictionloss_scale: 1.35
+joint_armature_scale: 1.12
+joint_dynamics_name_filters:
+  - hip_roll
+  - hip_yaw
+  - knee
+  - ankle
+motor_sensor_offsets:
+  - name_filters:
+      - waist_roll_joint
+    offset: 0.04
+body_inertial_scales:
+  - name_filters:
+      - waist_yaw_link
+    mass_scale: 1.10
+    inertia_scale: 1.10
+validation_log_enabled: 1
+validation_log_file: "/tmp/et1_mujoco_validation.csv"
+validation_log_decimation: 10

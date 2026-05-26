@@ -22,12 +22,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <mujoco/mujoco.h>
 #include "simulate.h"
@@ -102,6 +104,15 @@ namespace
 
   // control noise variables
   mjtNum *ctrlnoise = nullptr;
+
+  std::ofstream validation_log;
+  int validation_left_foot_site = -1;
+  int validation_right_foot_site = -1;
+  int validation_left_foot_vel_adr = -1;
+  int validation_right_foot_vel_adr = -1;
+  int validation_left_foot_force_adr = -1;
+  int validation_right_foot_force_adr = -1;
+  long long validation_step_count = 0;
 
   using Seconds = std::chrono::duration<double>;
 
@@ -271,6 +282,321 @@ namespace
 
   //------------------------------------------- simulation -------------------------------------------
 
+  int SensorAdrByName(const mjModel *model, const char *name)
+  {
+    const int sensor_id = mj_name2id(model, mjOBJ_SENSOR, name);
+    return sensor_id >= 0 ? model->sensor_adr[sensor_id] : -1;
+  }
+
+  void InitValidationLog(const mjModel *model)
+  {
+    validation_step_count = 0;
+    validation_left_foot_site = -1;
+    validation_right_foot_site = -1;
+    validation_left_foot_vel_adr = -1;
+    validation_right_foot_vel_adr = -1;
+    validation_left_foot_force_adr = -1;
+    validation_right_foot_force_adr = -1;
+    if (validation_log.is_open())
+    {
+      validation_log.close();
+    }
+    if (param::config.validation_log_enabled != 1)
+    {
+      return;
+    }
+
+    validation_left_foot_site = mj_name2id(model, mjOBJ_SITE, "left_foot");
+    validation_right_foot_site = mj_name2id(model, mjOBJ_SITE, "right_foot");
+    validation_left_foot_vel_adr = SensorAdrByName(model, "left_foot_global_linvel");
+    validation_right_foot_vel_adr = SensorAdrByName(model, "right_foot_global_linvel");
+    validation_left_foot_force_adr = SensorAdrByName(model, "left_foot_force");
+    validation_right_foot_force_adr = SensorAdrByName(model, "right_foot_force");
+
+    validation_log.open(param::config.validation_log_file, std::ios::out | std::ios::trunc);
+    if (!validation_log)
+    {
+      std::cerr << "Failed to open validation log: "
+                << param::config.validation_log_file << std::endl;
+      return;
+    }
+
+    validation_log
+        << "time,step,elastic_enabled,elastic_length,"
+        << "base_x,base_y,base_z,base_vx,base_vy,base_vz,"
+        << "left_x,left_y,left_z,left_vx,left_vy,left_vz,left_fx,left_fy,left_fz,"
+        << "right_x,right_y,right_z,right_vx,right_vy,right_vz,right_fx,right_fy,right_fz\n";
+    validation_log.flush();
+    std::printf("Validation log enabled at '%s' every %d sim steps\n",
+                param::config.validation_log_file.c_str(),
+                std::max(1, param::config.validation_log_decimation));
+  }
+
+  void WriteValidationLogFrame(const mjModel *model, const mjData *data)
+  {
+    if (!validation_log.is_open())
+    {
+      return;
+    }
+    const int decimation = std::max(1, param::config.validation_log_decimation);
+    if ((validation_step_count++ % decimation) != 0)
+    {
+      return;
+    }
+
+    auto site_value = [&](int site_id, int axis) -> mjtNum {
+      return site_id >= 0 ? data->site_xpos[3 * site_id + axis] : 0.0;
+    };
+    auto sensor_value = [&](int adr, int axis) -> mjtNum {
+      return adr >= 0 ? data->sensordata[adr + axis] : 0.0;
+    };
+
+    validation_log
+        << data->time << "," << validation_step_count << ","
+        << (elastic_band.enable_ ? 1 : 0) << "," << elastic_band.length_ << ","
+        << data->qpos[0] << "," << data->qpos[1] << "," << data->qpos[2] << ","
+        << data->qvel[0] << "," << data->qvel[1] << "," << data->qvel[2] << ","
+        << site_value(validation_left_foot_site, 0) << ","
+        << site_value(validation_left_foot_site, 1) << ","
+        << site_value(validation_left_foot_site, 2) << ","
+        << sensor_value(validation_left_foot_vel_adr, 0) << ","
+        << sensor_value(validation_left_foot_vel_adr, 1) << ","
+        << sensor_value(validation_left_foot_vel_adr, 2) << ","
+        << sensor_value(validation_left_foot_force_adr, 0) << ","
+        << sensor_value(validation_left_foot_force_adr, 1) << ","
+        << sensor_value(validation_left_foot_force_adr, 2) << ","
+        << site_value(validation_right_foot_site, 0) << ","
+        << site_value(validation_right_foot_site, 1) << ","
+        << site_value(validation_right_foot_site, 2) << ","
+        << sensor_value(validation_right_foot_vel_adr, 0) << ","
+        << sensor_value(validation_right_foot_vel_adr, 1) << ","
+        << sensor_value(validation_right_foot_vel_adr, 2) << ","
+        << sensor_value(validation_right_foot_force_adr, 0) << ","
+        << sensor_value(validation_right_foot_force_adr, 1) << ","
+        << sensor_value(validation_right_foot_force_adr, 2) << "\n";
+    validation_log.flush();
+  }
+
+  bool JointNameMatchesFilters(const char *joint_name)
+  {
+    if (param::config.joint_dynamics_name_filters.empty())
+    {
+      return true;
+    }
+
+    if (!joint_name)
+    {
+      return false;
+    }
+
+    std::string name(joint_name);
+    for (const auto &filter : param::config.joint_dynamics_name_filters)
+    {
+      if (!filter.empty() && name.find(filter) != std::string::npos)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool JointNameMatchesFilters(const char *joint_name, const std::vector<std::string> &filters)
+  {
+    if (filters.empty())
+    {
+      return false;
+    }
+
+    if (!joint_name)
+    {
+      return false;
+    }
+
+    std::string name(joint_name);
+    for (const auto &filter : filters)
+    {
+      if (!filter.empty() && name.find(filter) != std::string::npos)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool NameMatchesFilters(const char *name, const std::vector<std::string> &filters)
+  {
+    if (filters.empty() || !name)
+    {
+      return false;
+    }
+
+    const std::string object_name(name);
+    for (const auto &filter : filters)
+    {
+      if (!filter.empty() && object_name.find(filter) != std::string::npos)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  int JointDofCount(const mjModel *model, int joint_id)
+  {
+    switch (model->jnt_type[joint_id])
+    {
+    case mjJNT_FREE:
+      return 6;
+    case mjJNT_BALL:
+      return 3;
+    case mjJNT_SLIDE:
+    case mjJNT_HINGE:
+      return 1;
+    default:
+      return 0;
+    }
+  }
+
+  void ApplyJointDynamicsScaling(mjModel *model)
+  {
+    if (param::config.enable_joint_dynamics_scaling == 0)
+    {
+      return;
+    }
+
+    const double damping_scale = param::config.joint_damping_scale;
+    const double frictionloss_scale = param::config.joint_frictionloss_scale;
+    const double armature_scale = param::config.joint_armature_scale;
+    if (damping_scale == 1.0 && frictionloss_scale == 1.0 && armature_scale == 1.0
+        && param::config.joint_dynamics_overrides.empty())
+    {
+      return;
+    }
+
+    std::vector<mjtNum> orig_damping(model->dof_damping, model->dof_damping + model->nv);
+    std::vector<mjtNum> orig_frictionloss(model->dof_frictionloss, model->dof_frictionloss + model->nv);
+    std::vector<mjtNum> orig_armature(model->dof_armature, model->dof_armature + model->nv);
+
+    int scaled_joint_count = 0;
+    int scaled_dof_count = 0;
+    std::printf("Apply joint dynamics scaling: damping=%.3f frictionloss=%.3f armature=%.3f, overrides=%zu\n",
+                damping_scale, frictionloss_scale, armature_scale,
+                param::config.joint_dynamics_overrides.size());
+
+    for (int joint_id = 0; joint_id < model->njnt; ++joint_id)
+    {
+      const char *joint_name = mj_id2name(model, mjOBJ_JOINT, joint_id);
+      bool should_scale = JointNameMatchesFilters(joint_name);
+      double joint_damping_scale = damping_scale;
+      double joint_frictionloss_scale = frictionloss_scale;
+      double joint_armature_scale = armature_scale;
+      const char *scale_source = "global";
+      for (const auto &item : param::config.joint_dynamics_overrides)
+      {
+        if (JointNameMatchesFilters(joint_name, item.name_filters))
+        {
+          should_scale = true;
+          joint_damping_scale = item.damping_scale;
+          joint_frictionloss_scale = item.frictionloss_scale;
+          joint_armature_scale = item.armature_scale;
+          scale_source = "override";
+          break;
+        }
+      }
+
+      if (!should_scale)
+      {
+        continue;
+      }
+
+      const int dof_adr = model->jnt_dofadr[joint_id];
+      const int dof_count = JointDofCount(model, joint_id);
+      if (dof_adr < 0 || dof_count <= 0)
+      {
+        continue;
+      }
+
+      ++scaled_joint_count;
+      scaled_dof_count += dof_count;
+      std::printf("  joint %s: dof %d..%d (%s damping=%.3f frictionloss=%.3f armature=%.3f)\n",
+                  joint_name ? joint_name : "(unnamed)",
+                  dof_adr,
+                  dof_adr + dof_count - 1,
+                  scale_source,
+                  joint_damping_scale,
+                  joint_frictionloss_scale,
+                  joint_armature_scale);
+
+      for (int i = 0; i < dof_count; ++i)
+      {
+        const int dof_id = dof_adr + i;
+        model->dof_damping[dof_id] = orig_damping[dof_id] * joint_damping_scale;
+        model->dof_frictionloss[dof_id] = orig_frictionloss[dof_id] * joint_frictionloss_scale;
+        model->dof_armature[dof_id] = orig_armature[dof_id] * joint_armature_scale;
+        std::printf("    dof %d: damping %.6g -> %.6g, frictionloss %.6g -> %.6g, armature %.6g -> %.6g\n",
+                    dof_id,
+                    orig_damping[dof_id], model->dof_damping[dof_id],
+                    orig_frictionloss[dof_id], model->dof_frictionloss[dof_id],
+                    orig_armature[dof_id], model->dof_armature[dof_id]);
+      }
+    }
+
+    std::printf("Scaled %d joints (%d dofs).\n", scaled_joint_count, scaled_dof_count);
+  }
+
+  void ApplyBodyInertialScaling(mjModel *model)
+  {
+    if (param::config.body_inertial_scales.empty())
+    {
+      return;
+    }
+
+    int scaled_body_count = 0;
+    std::printf("Apply body inertial scaling: entries=%zu\n",
+                param::config.body_inertial_scales.size());
+
+    for (int body_id = 1; body_id < model->nbody; ++body_id)
+    {
+      const char *body_name = mj_id2name(model, mjOBJ_BODY, body_id);
+      for (const auto &item : param::config.body_inertial_scales)
+      {
+        if (!NameMatchesFilters(body_name, item.name_filters))
+        {
+          continue;
+        }
+
+        const mjtNum old_mass = model->body_mass[body_id];
+        const mjtNum old_inertia[3] = {
+            model->body_inertia[3 * body_id + 0],
+            model->body_inertia[3 * body_id + 1],
+            model->body_inertia[3 * body_id + 2],
+        };
+
+        model->body_mass[body_id] *= item.mass_scale;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+          model->body_inertia[3 * body_id + axis] *= item.inertia_scale;
+        }
+
+        ++scaled_body_count;
+        std::printf("  body %s: mass %.6g -> %.6g, inertia [%.6g %.6g %.6g] -> [%.6g %.6g %.6g]\n",
+                    body_name ? body_name : "(unnamed)",
+                    old_mass,
+                    model->body_mass[body_id],
+                    old_inertia[0], old_inertia[1], old_inertia[2],
+                    model->body_inertia[3 * body_id + 0],
+                    model->body_inertia[3 * body_id + 1],
+                    model->body_inertia[3 * body_id + 2]);
+        break;
+      }
+    }
+
+    std::printf("Scaled %d bodies.\n", scaled_body_count);
+  }
+
   mjModel *LoadModel(const char *file, mj::Simulate &sim)
   {
     // this copy is needed so that the mju::strlen call below compiles
@@ -324,6 +650,9 @@ namespace
       std::printf("Override MuJoCo timestep with sim_dt=%.6f s\n", param::config.sim_dt);
     }
 
+    ApplyBodyInertialScaling(mnew);
+    ApplyJointDynamicsScaling(mnew);
+
     // compiler warning: print and pause
     if (loadError[0])
     {
@@ -372,6 +701,7 @@ namespace
           free(ctrlnoise);
           ctrlnoise = (mjtNum *)malloc(sizeof(mjtNum) * m->nu);
           mju_zero(ctrlnoise, m->nu);
+          InitValidationLog(m);
         }
         else
         {
@@ -402,6 +732,7 @@ namespace
           free(ctrlnoise);
           ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
           mju_zero(ctrlnoise, m->nu);
+          InitValidationLog(m);
         }
         else
         {
@@ -516,6 +847,7 @@ namespace
                 // call mj_step
                 mj_step(m, d);
                 stepped = true;
+                WriteValidationLogFrame(m, d);
 
                 // break if reset
                 if (d->time < prevSim)
@@ -565,6 +897,7 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
       free(ctrlnoise);
       ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
       mju_zero(ctrlnoise, m->nu);
+      InitValidationLog(m);
     }
     else
     {
@@ -648,19 +981,37 @@ __attribute__((used, visibility("default"))) extern "C" void _mj_rosettaError(co
 }
 #endif
 
+void apply_elastic_band_key(int key)
+{
+  if (param::config.enable_elastic_band != 1) {
+    return;
+  }
+
+  if (key == GLFW_KEY_9 || key == '9') {
+    elastic_band.enable_ = !elastic_band.enable_;
+    std::printf("Elastic band %s\n", elastic_band.enable_ ? "enabled" : "disabled");
+  } else if (key == GLFW_KEY_7 || key == GLFW_KEY_UP || key == '7') {
+    elastic_band.length_ -= 0.1;
+    std::printf("Elastic band length %.3f\n", elastic_band.length_);
+  } else if (key == GLFW_KEY_8 || key == GLFW_KEY_DOWN || key == '8') {
+    elastic_band.length_ += 0.1;
+    std::printf("Elastic band length %.3f\n", elastic_band.length_);
+  }
+}
+
+void StdinControlThread()
+{
+  char ch = '\0';
+  while (std::cin.get(ch)) {
+    apply_elastic_band_key(static_cast<int>(ch));
+  }
+}
+
 // user keyboard callback
 void user_key_cb(GLFWwindow* window, int key, int scancode, int act, int mods) {
   if (act==GLFW_PRESS)
   {
-    if(param::config.enable_elastic_band == 1) {
-      if (key==GLFW_KEY_9) {
-        elastic_band.enable_ = !elastic_band.enable_;
-      } else if (key==GLFW_KEY_7 || key==GLFW_KEY_UP) {
-        elastic_band.length_ -= 0.1;
-      } else if (key==GLFW_KEY_8 || key==GLFW_KEY_DOWN) {
-        elastic_band.length_ += 0.1;
-      }
-    }
+    apply_elastic_band_key(key);
     if(key==GLFW_KEY_BACKSPACE) {
       mj_resetData(m, d);
       mj_forward(m, d);
@@ -714,6 +1065,8 @@ int main(int argc, char **argv)
     &cam, &opt, &pert, /* is_passive = */ false);
 
   std::thread unitree_thread(UnitreeSdk2BridgeThread, nullptr);
+  std::thread stdin_control_thread(StdinControlThread);
+  stdin_control_thread.detach();
 
   // start physics thread
   std::thread physicsthreadhandle(&PhysicsThread, sim.get(), param::config.robot_scene.c_str());
