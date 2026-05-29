@@ -1,4 +1,4 @@
-<mujoco model="galbot_et1_26_sdk_collision">
+<mujoco model="et1_v2_collision_foot_mesh">
   <compiler angle="radian" meshdir="meshes/" autolimits="true" discardvisual="false" />
   <default>
     <joint damping="0.001" armature="0.01" frictionloss="0.1" />

@@ -17,6 +17,7 @@
 #include "glfw_adapter.h"
 #undef private
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -26,8 +27,10 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <mujoco/mujoco.h>
 #include "simulate.h"
@@ -47,6 +50,9 @@ extern "C"
 #include <mach-o/dyld.h>
 #endif
 #include <sys/errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 }
@@ -270,6 +276,145 @@ namespace
   }
 
   //------------------------------------------- simulation -------------------------------------------
+
+  struct FootContactStatus
+  {
+    bool left = false;
+    bool right = false;
+  };
+
+  bool Contains(const std::string& value, const std::string& needle)
+  {
+    return value.find(needle) != std::string::npos;
+  }
+
+  bool IsFootGeom(int geom_id, const std::string& side)
+  {
+    if (!m || geom_id < 0)
+    {
+      return false;
+    }
+
+    const char* name = mj_id2name(m, mjOBJ_GEOM, geom_id);
+    if (!name)
+    {
+      return false;
+    }
+
+    const std::string geom_name(name);
+    return Contains(geom_name, side) &&
+           (Contains(geom_name, "foot") || Contains(geom_name, "ankle_roll"));
+  }
+
+  FootContactStatus GetFootContactStatus()
+  {
+    FootContactStatus status;
+    if (!m || !d)
+    {
+      return status;
+    }
+
+    const int floor_id = mj_name2id(m, mjOBJ_GEOM, "floor");
+    for (int i = 0; i < d->ncon; ++i)
+    {
+      const auto& contact = d->contact[i];
+      const int geom1 = contact.geom1;
+      const int geom2 = contact.geom2;
+      if (floor_id >= 0 && geom1 != floor_id && geom2 != floor_id)
+      {
+        continue;
+      }
+
+      const int other_geom = geom1 == floor_id ? geom2 : (geom2 == floor_id ? geom1 : geom1);
+      status.left = status.left || IsFootGeom(other_geom, "left");
+      status.right = status.right || IsFootGeom(other_geom, "right");
+    }
+
+    return status;
+  }
+
+  std::string SimControlResponse(const std::string& command, mj::Simulate* sim)
+  {
+    const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
+
+    if (command == "lower")
+    {
+      elastic_band.enable_ = true;
+      elastic_band.length_ += param::config.sim_control_band_step;
+      std::ostringstream out;
+      out << "ok band=1 length=" << elastic_band.length_;
+      return out.str();
+    }
+    if (command == "release")
+    {
+      elastic_band.enable_ = false;
+      return "ok band=0";
+    }
+    if (command == "hold")
+    {
+      elastic_band.enable_ = true;
+      return "ok band=1";
+    }
+    if (command == "status")
+    {
+      const auto contact = GetFootContactStatus();
+      std::ostringstream out;
+      out << "ok left=" << (contact.left ? 1 : 0)
+          << " right=" << (contact.right ? 1 : 0)
+          << " both=" << (contact.left && contact.right ? 1 : 0)
+          << " band=" << (elastic_band.enable_ ? 1 : 0)
+          << " length=" << elastic_band.length_;
+      return out.str();
+    }
+
+    return "error unknown_command";
+  }
+
+  void SimControlThread(mj::Simulate* sim)
+  {
+    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+    {
+      std::perror("Sim control socket");
+      return;
+    }
+
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(param::config.sim_control_port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+    {
+      std::perror("Sim control bind");
+      close(sock);
+      return;
+    }
+
+    std::printf("Sim control UDP listening on 127.0.0.1:%d\n", param::config.sim_control_port);
+    while (!sim->exitrequest.load())
+    {
+      char buffer[128] = {};
+      sockaddr_in client_addr {};
+      socklen_t client_len = sizeof(client_addr);
+      const ssize_t n = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                                 reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+      if (n <= 0)
+      {
+        continue;
+      }
+
+      std::string command(buffer, static_cast<size_t>(n));
+      command.erase(std::remove(command.begin(), command.end(), '\n'), command.end());
+      command.erase(std::remove(command.begin(), command.end(), '\r'), command.end());
+
+      const std::string response = SimControlResponse(command, sim);
+      sendto(sock, response.c_str(), response.size(), 0,
+             reinterpret_cast<sockaddr*>(&client_addr), client_len);
+    }
+
+    close(sock);
+  }
 
   mjModel *LoadModel(const char *file, mj::Simulate &sim)
   {
@@ -622,7 +767,7 @@ void *UnitreeSdk2BridgeThread(void *arg)
   }
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
-  if (param::config.robot == "r1" || param::config.robot == "et1_v1" || param::config.robot == "tdf_ET1") {
+  if (param::config.robot == "r1" || param::config.robot == "et1_v1" || param::config.robot == "et1_v2") {
     interface = std::make_unique<R1Bridge>(m, d);
   } else if (m->nu > NUM_MOTOR_IDL_GO) {
     interface = std::make_unique<G1Bridge>(m, d);
@@ -714,6 +859,8 @@ int main(int argc, char **argv)
     &cam, &opt, &pert, /* is_passive = */ false);
 
   std::thread unitree_thread(UnitreeSdk2BridgeThread, nullptr);
+  std::thread sim_control_thread(SimControlThread, sim.get());
+  sim_control_thread.detach();
 
   // start physics thread
   std::thread physicsthreadhandle(&PhysicsThread, sim.get(), param::config.robot_scene.c_str());

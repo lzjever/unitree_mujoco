@@ -1,4 +1,4 @@
-<mujoco model="galbot_r1">
+<mujoco model="et1_v2">
   <compiler angle="radian" meshdir="meshes/" autolimits="true" discardvisual="false"/>
 
   <default>

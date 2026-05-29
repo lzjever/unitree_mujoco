@@ -24,6 +24,8 @@ inline struct SimulationConfig
     int print_scene_information;
 
     int enable_elastic_band;
+    int sim_control_port = 8090;
+    double sim_control_band_step = 0.1;
     int band_attached_link = 0;
     double sim_dt = 0.0;
 
@@ -42,6 +44,12 @@ inline struct SimulationConfig
             joystick_bits = cfg["joystick_bits"].as<int>();
             print_scene_information = cfg["print_scene_information"].as<int>();
             enable_elastic_band = cfg["enable_elastic_band"].as<int>();
+            if (cfg["sim_control_port"]) {
+                sim_control_port = cfg["sim_control_port"].as<int>();
+            }
+            if (cfg["sim_control_band_step"]) {
+                sim_control_band_step = cfg["sim_control_band_step"].as<double>();
+            }
             if (cfg["sim_dt"]) {
                 sim_dt = cfg["sim_dt"].as<double>();
             }
@@ -68,6 +76,7 @@ inline po::variables_map helper(int argc, char** argv)
         ("robot,r", po::value<std::string>(&config.robot), "Robot type; -r go2")
         ("scene,s", po::value<std::filesystem::path>(&config.robot_scene), "Robot scene file; -s scene_terrain.xml")
         ("sim_dt", po::value<double>(&config.sim_dt), "Override MuJoCo timestep after loading XML; --sim_dt 0.001")
+        ("sim_control_port", po::value<int>(&config.sim_control_port), "UDP localhost port for sim control; --sim_control_port 8090")
     ;
 
     po::variables_map vm;
