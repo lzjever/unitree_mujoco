@@ -123,6 +123,9 @@ add_executable(reference_frame_selftest
   src/ghost_scene_overlay.cc
 )
 target_include_directories(reference_frame_selftest PRIVATE ${SIM_INCLUDE_DIRS})
+target_compile_definitions(reference_frame_selftest PRIVATE
+  UNITREE_MUJOCO_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 add_test(NAME reference_frame_selftest COMMAND reference_frame_selftest)
 
 add_executable(jstest src/joystick/jstest.cc src/joystick/joystick.cc)

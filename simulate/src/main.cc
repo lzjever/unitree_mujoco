@@ -39,6 +39,9 @@
 #include "unitree_sdk2_bridge.h"
 #include "param.h"
 
+#include <array>
+#include <cmath>
+
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
 #define NUM_MOTOR_IDL_GO 20
 
@@ -104,10 +107,103 @@ namespace
   mjModel *m = nullptr;
   mjData *d = nullptr;
 
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+  agentic_ref::ReferenceFrameCache* g_ghost_cache = nullptr;
+  std::mutex g_ghost_alignment_mutex;
+  agentic_ref::GhostFrameTransform g_ghost_alignment;
+#endif
+
   // control noise variables
   mjtNum *ctrlnoise = nullptr;
 
   using Seconds = std::chrono::duration<double>;
+
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+  bool CopyLivePelvisPose(std::array<double, 3>* pos, std::array<double, 4>* quat)
+  {
+    if (!m || !d || !pos || !quat)
+    {
+      return false;
+    }
+    const int pelvis_id = mj_name2id(m, mjOBJ_BODY, "pelvis_link");
+    if (pelvis_id < 0)
+    {
+      return false;
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+      (*pos)[i] = d->xpos[3 * pelvis_id + i];
+      if (!std::isfinite((*pos)[i]))
+      {
+        return false;
+      }
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+      (*quat)[i] = d->xquat[4 * pelvis_id + i];
+      if (!std::isfinite((*quat)[i]))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  agentic_ref::GhostFrameTransform SnapshotGhostAlignment()
+  {
+    std::lock_guard<std::mutex> lock(g_ghost_alignment_mutex);
+    return g_ghost_alignment;
+  }
+
+  void AlignGhostReferenceRoot()
+  {
+    if (!g_ghost_cache)
+    {
+      std::cout << "Reference ghost align skipped: ghost cache unavailable." << std::endl;
+      return;
+    }
+
+    auto frame = g_ghost_cache->LatestFresh(
+        std::chrono::milliseconds(param::config.ghost_ref_stale_ms),
+        static_cast<double>(param::config.ghost_ref_stale_ms));
+    if (!frame)
+    {
+      std::cout << "Reference ghost align skipped: no active reference." << std::endl;
+      return;
+    }
+
+    std::array<double, 3> live_pos{};
+    std::array<double, 4> live_quat{};
+    if (!CopyLivePelvisPose(&live_pos, &live_quat))
+    {
+      std::cout << "Reference ghost align skipped: live pelvis unavailable." << std::endl;
+      return;
+    }
+
+    const auto transform = agentic_ref::ComputeYawTranslationAlignment(
+        frame->p[0], frame->q[0], live_pos, live_quat);
+    if (!transform.enabled)
+    {
+      std::cout << "Reference ghost align skipped: invalid root pose." << std::endl;
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(g_ghost_alignment_mutex);
+      g_ghost_alignment = transform;
+    }
+    std::cout << "Reference ghost root aligned." << std::endl;
+  }
+
+  void ClearGhostReferenceRootAlignment()
+  {
+    {
+      std::lock_guard<std::mutex> lock(g_ghost_alignment_mutex);
+      g_ghost_alignment = agentic_ref::GhostFrameTransform{};
+    }
+    std::cout << "Reference ghost root alignment cleared." << std::endl;
+  }
+#endif
 
   //---------------------------------------- plugin handling -----------------------------------------
 
@@ -656,6 +752,19 @@ __attribute__((used, visibility("default"))) extern "C" void _mj_rosettaError(co
 void user_key_cb(GLFWwindow* window, int key, int scancode, int act, int mods) {
   if (act==GLFW_PRESS)
   {
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+    if (key == GLFW_KEY_G)
+    {
+      if (mods & (GLFW_MOD_SHIFT | GLFW_MOD_CONTROL))
+      {
+        ClearGhostReferenceRootAlignment();
+      }
+      else
+      {
+        AlignGhostReferenceRoot();
+      }
+    }
+#endif
     if(param::config.enable_elastic_band == 1) {
       if (key==GLFW_KEY_9) {
         elastic_band.enable_ = !elastic_band.enable_;
@@ -734,6 +843,7 @@ int main(int argc, char **argv)
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
   agentic_ref::ReferenceFrameCache ghost_cache;
   std::unique_ptr<agentic_ref::ReferenceFrameClient> ghost_client;
+  g_ghost_cache = &ghost_cache;
   if (param::config.ghost_ref_enable)
   {
     agentic_ref::ReferenceFrameClientConfig ghost_config;
@@ -749,7 +859,7 @@ int main(int argc, char **argv)
           static_cast<double>(param::config.ghost_ref_stale_ms));
       if (frame)
       {
-        agentic_ref::AppendGhostOverlay(*frame, scene);
+        agentic_ref::AppendGhostOverlay(*frame, scene, {}, m, SnapshotGhostAlignment());
       }
     };
     std::cout << "Reference ghost enabled: " << param::config.ghost_ref_url << std::endl;
@@ -768,6 +878,7 @@ int main(int argc, char **argv)
   {
     ghost_client->Stop();
   }
+  g_ghost_cache = nullptr;
 #endif
   physicsthreadhandle.join();
 

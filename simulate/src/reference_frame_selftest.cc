@@ -1,3 +1,5 @@
+#include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -12,6 +14,10 @@
 
 namespace
 {
+
+#ifndef UNITREE_MUJOCO_REPO_DIR
+#define UNITREE_MUJOCO_REPO_DIR "."
+#endif
 
 std::string ActiveJson(const std::string& schema = agentic_ref::kSchema,
                        const std::string& body_order = agentic_ref::kBodyOrder,
@@ -47,6 +53,53 @@ bool Expect(bool condition, const char* message)
   return true;
 }
 
+bool ExpectSizeEq(std::size_t actual, std::size_t expected, const char* message)
+{
+  if (actual != expected)
+  {
+    std::cerr << "FAIL: " << message << " expected " << expected
+              << ", got " << actual << std::endl;
+    return false;
+  }
+  return true;
+}
+
+bool Near(double lhs, double rhs, double eps = 1e-9)
+{
+  return std::fabs(lhs - rhs) <= eps;
+}
+
+bool NearVec3(const std::array<double, 3>& lhs, const std::array<double, 3>& rhs,
+              double eps = 1e-9)
+{
+  return Near(lhs[0], rhs[0], eps) && Near(lhs[1], rhs[1], eps) &&
+         Near(lhs[2], rhs[2], eps);
+}
+
+std::array<double, 4> YawQuat(double yaw)
+{
+  return {std::cos(0.5 * yaw), 0.0, 0.0, std::sin(0.5 * yaw)};
+}
+
+double YawFromQuat(const std::array<double, 4>& q)
+{
+  return std::atan2(2.0 * (q[0] * q[3] + q[1] * q[2]),
+                    1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3]));
+}
+
+std::array<double, 3> ApplyYawTranslation(const std::array<double, 3>& p,
+                                          double yaw,
+                                          const std::array<double, 3>& t)
+{
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  return {
+      c * p[0] - s * p[1] + t[0],
+      s * p[0] + c * p[1] + t[1],
+      p[2] + t[2],
+  };
+}
+
 std::string ReplaceRequired(std::string text, const std::string& from, const std::string& to)
 {
   std::size_t pos = text.find(from);
@@ -70,6 +123,43 @@ int main()
   pass &= Expect(active.ok && active.active, "active frame parses");
   pass &= Expect(active.frame.p[26][2] > 1.0, "body positions parsed");
   pass &= Expect(active.frame.c[0] && !active.frame.c[1], "contacts parsed");
+
+  pass &= Expect(agentic_ref::kEt1BodyNames.size() == agentic_ref::kBodyCount,
+                 "body mapping has expected length");
+  const std::array<const char*, agentic_ref::kBodyCount> expected_body_names = {{
+      "pelvis_link",
+      "left_hip_pitch_link",
+      "left_hip_roll_link",
+      "left_hip_yaw_link",
+      "left_knee_link",
+      "left_ankle_pitch_link",
+      "left_ankle_roll_link",
+      "right_hip_pitch_link",
+      "right_hip_roll_link",
+      "right_hip_yaw_link",
+      "right_knee_link",
+      "right_ankle_pitch_link",
+      "right_ankle_roll_link",
+      "waist_roll_link",
+      "waist_yaw_link",
+      "left_shoulder_pitch_link",
+      "left_shoulder_roll_link",
+      "left_shoulder_yaw_link",
+      "left_elbow_link",
+      "left_wrist_roll_link",
+      "right_shoulder_pitch_link",
+      "right_shoulder_roll_link",
+      "right_shoulder_yaw_link",
+      "right_elbow_link",
+      "right_wrist_roll_link",
+      "head_pitch_link",
+      "head_yaw_link",
+  }};
+  for (int i = 0; i < agentic_ref::kBodyCount; ++i)
+  {
+    pass &= Expect(std::string(agentic_ref::kEt1BodyNames[i]) == expected_body_names[i],
+                   "body mapping name matches fixed et1_27_v1 order");
+  }
 
   auto bad_schema = agentic_ref::ParseReferenceFrameJson(ActiveJson("BAD"));
   pass &= Expect(!bad_schema.ok, "schema mismatch rejected");
@@ -153,6 +243,94 @@ int main()
   mjv_makeScene(nullptr, &scene, 100);
   std::size_t added = agentic_ref::AppendGhostOverlay(active.frame, &scene);
   pass &= Expect(added == 56 && scene.ngeom == 56, "overlay expected geom count");
+  mjv_freeScene(&scene);
+
+  const std::filesystem::path robot_xml =
+      std::filesystem::path(UNITREE_MUJOCO_REPO_DIR) /
+      "unitree_robots" / "tdf_ET1" / "tdf_ET1.xml";
+  char load_error[1024] = "";
+  mjModel* et1_model = mj_loadXML(robot_xml.c_str(), nullptr, load_error, sizeof(load_error));
+  pass &= Expect(et1_model != nullptr, "tdf_ET1.xml loads");
+  if (et1_model)
+  {
+    for (int i = 0; i < agentic_ref::kBodyCount; ++i)
+    {
+      const int body_id = mj_name2id(et1_model, mjOBJ_BODY, agentic_ref::kEt1BodyNames[i]);
+      pass &= Expect(body_id >= 0, "mapped ET1 body resolves in tdf_ET1.xml");
+    }
+
+    const auto visual_geoms = agentic_ref::BuildEt1VisualMeshGeoms(et1_model);
+    pass &= ExpectSizeEq(visual_geoms.size(), 40,
+                         "visual mesh geom count for mapped ET1 bodies");
+
+    mjv_defaultScene(&scene);
+    mjv_makeScene(et1_model, &scene, 200);
+    added = agentic_ref::AppendGhostOverlay(active.frame, &scene, {}, et1_model);
+    bool found_mesh = false;
+    bool found_transparent_mesh = false;
+    for (int i = 0; i < scene.ngeom; ++i)
+    {
+      if (scene.geoms[i].type == mjGEOM_MESH)
+      {
+        found_mesh = true;
+        if (scene.geoms[i].rgba[3] < 1.0f && scene.geoms[i].transparent)
+        {
+          found_transparent_mesh = true;
+        }
+      }
+    }
+    pass &= Expect(added > 56, "full model ghost appends mesh geoms");
+    pass &= Expect(found_mesh, "full model ghost includes at least one mesh geom");
+    pass &= Expect(found_transparent_mesh, "full model ghost mesh is transparent");
+    mjv_freeScene(&scene);
+
+    mjv_defaultScene(&scene);
+    mjv_makeScene(et1_model, &scene, 7);
+    added = agentic_ref::AppendGhostOverlay(active.frame, &scene, {}, et1_model);
+    pass &= Expect(added == 7 && scene.ngeom == 7, "full model overlay respects maxgeom cap");
+    mjv_freeScene(&scene);
+
+    mj_deleteModel(et1_model);
+  }
+
+  const double ref_yaw = 0.25;
+  const double live_yaw = 1.10;
+  auto align_frame = active.frame;
+  align_frame.p[0] = {1.0, -2.0, 0.7};
+  align_frame.q[0] = YawQuat(ref_yaw);
+  const std::array<double, 3> live_root = {-0.5, 3.0, 1.2};
+  const auto live_quat = YawQuat(live_yaw);
+  const auto alignment = agentic_ref::ComputeYawTranslationAlignment(
+      align_frame.p[0], align_frame.q[0], live_root, live_quat);
+  const auto aligned_frame = agentic_ref::TransformReferenceFrame(align_frame, alignment);
+  pass &= Expect(alignment.enabled, "yaw+translation alignment produced an offset");
+  pass &= Expect(NearVec3(aligned_frame.p[0], live_root, 1e-8),
+                 "yaw+translation alignment maps ref root to live root");
+  pass &= Expect(Near(YawFromQuat(aligned_frame.q[0]), live_yaw, 1e-8),
+                 "yaw+translation alignment maps ref root yaw to live yaw");
+
+  agentic_ref::GhostFrameTransform manual_transform;
+  manual_transform.enabled = true;
+  manual_transform.yaw = 0.5;
+  manual_transform.translation = {0.25, -0.5, 0.75};
+  const auto transformed_frame =
+      agentic_ref::TransformReferenceFrame(active.frame, manual_transform);
+  pass &= Expect(NearVec3(transformed_frame.com,
+                         ApplyYawTranslation(active.frame.com,
+                                             manual_transform.yaw,
+                                             manual_transform.translation)),
+                 "transform applies to COM");
+
+  mjv_defaultScene(&scene);
+  mjv_makeScene(nullptr, &scene, 100);
+  added = agentic_ref::AppendGhostOverlay(active.frame, &scene, {},
+                                          nullptr, manual_transform);
+  pass &= Expect(added == 56 && scene.ngeom == 56, "transformed skeleton overlay count");
+  const int com_geom_index = 26 + agentic_ref::kBodyCount;
+  pass &= Expect(Near(scene.geoms[com_geom_index].pos[0], transformed_frame.com[0], 1e-6) &&
+                 Near(scene.geoms[com_geom_index].pos[1], transformed_frame.com[1], 1e-6) &&
+                 Near(scene.geoms[com_geom_index].pos[2], transformed_frame.com[2], 1e-6),
+                 "transform applies to rendered COM marker");
   mjv_freeScene(&scene);
 
   mjv_defaultScene(&scene);

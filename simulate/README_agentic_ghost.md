@@ -1,7 +1,7 @@
 # Agentic Reference Ghost Viewer
 
 `unitree_mujoco_agentic_ghost` is an opt-in simulator binary that renders a
-reference ET1 skeleton from the tracker hidden endpoint:
+reference ET1 ghost from the tracker hidden endpoint:
 
 ```bash
 GET http://127.0.0.1:8083/_sim/reference_frame
@@ -41,10 +41,17 @@ original `unitree_mujoco` binary.
 
 ## Behavior
 
-The overlay uses the packet `body_order` `et1_27_v1` directly and does not read
-or write MuJoCo body indices, `qpos`, or `qvel`. It appends transparent spheres,
-capsules, a COM marker, and foot contact markers to `mjvScene` immediately
-before rendering.
+The overlay uses the packet `body_order` `et1_27_v1` directly and does not
+write MuJoCo body indices, `qpos`, or `qvel`. For `tdf_ET1.xml`, it maps the
+fixed `et1_27_v1` body order to ET1 visual mesh geoms and appends a full
+semi-transparent robot model to `mjvScene` immediately before rendering. It
+also keeps the original skeleton capsules, joint spheres, COM marker, and foot
+contact markers as auxiliary guides.
+
+Press `G` to align the reference root to the live `pelvis_link` using yaw plus
+translation. The offset is applied to all later reference body poses, COM,
+skeleton guides, and model ghost rendering. Press `G` again to update the
+offset. Press `Shift+G` or `Ctrl+G` to clear it.
 
 The default 25 Hz polling rate is low-risk for local visualization. Use 50 or
 60 Hz when the reference should visually track a 50 Hz `.trk` more closely.
