@@ -32,6 +32,10 @@
 #include <mujoco/mujoco.h>
 #include "simulate.h"
 #include "array_safety.h"
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+#include "ghost_scene_overlay.h"
+#include "reference_frame_client.h"
+#endif
 #include "unitree_sdk2_bridge.h"
 #include "param.h"
 
@@ -703,7 +707,21 @@ int main(int argc, char **argv)
   // Load simulation configuration
   std::filesystem::path proj_dir = std::filesystem::path(getExecutableDir()).parent_path();
   param::config.load_from_yaml(proj_dir / "config.yaml");
-  param::helper(argc, argv);
+  auto cli = param::helper(argc, argv);
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+#ifdef UNITREE_MUJOCO_GHOST_DEFAULT_ENABLED
+  if (!cli.count("ghost_ref_enable"))
+  {
+    param::config.ghost_ref_enable = 1;
+  }
+#endif
+  if (cli.count("ghost_ref_url") && !cli.count("ghost_ref_enable"))
+  {
+    param::config.ghost_ref_enable = 1;
+  }
+#else
+  (void)cli;
+#endif
   if(param::config.robot_scene.is_relative()) {
     param::config.robot_scene = proj_dir.parent_path() / "unitree_robots" / param::config.robot / param::config.robot_scene;
   }
@@ -713,6 +731,31 @@ int main(int argc, char **argv)
     std::make_unique<mj::GlfwAdapter>(),
     &cam, &opt, &pert, /* is_passive = */ false);
 
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+  agentic_ref::ReferenceFrameCache ghost_cache;
+  std::unique_ptr<agentic_ref::ReferenceFrameClient> ghost_client;
+  if (param::config.ghost_ref_enable)
+  {
+    agentic_ref::ReferenceFrameClientConfig ghost_config;
+    ghost_config.url = param::config.ghost_ref_url;
+    ghost_config.poll_hz = param::config.ghost_ref_poll_hz;
+    ghost_config.timeout_ms = param::config.ghost_ref_timeout_ms;
+    ghost_client = std::make_unique<agentic_ref::ReferenceFrameClient>(ghost_config, &ghost_cache);
+    ghost_client->Start();
+    sim->scene_overlay_callback = [&ghost_cache](mjvScene* scene)
+    {
+      auto frame = ghost_cache.LatestFresh(
+          std::chrono::milliseconds(param::config.ghost_ref_stale_ms),
+          static_cast<double>(param::config.ghost_ref_stale_ms));
+      if (frame)
+      {
+        agentic_ref::AppendGhostOverlay(*frame, scene);
+      }
+    };
+    std::cout << "Reference ghost enabled: " << param::config.ghost_ref_url << std::endl;
+  }
+#endif
+
   std::thread unitree_thread(UnitreeSdk2BridgeThread, nullptr);
 
   // start physics thread
@@ -720,6 +763,12 @@ int main(int argc, char **argv)
   // start simulation UI loop (blocking call)
   glfwSetKeyCallback(static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_,user_key_cb);
   sim->RenderLoop();
+#ifdef UNITREE_MUJOCO_GHOST_VIEWER
+  if (ghost_client)
+  {
+    ghost_client->Stop();
+  }
+#endif
   physicsthreadhandle.join();
 
   pthread_exit(NULL);
