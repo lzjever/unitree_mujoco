@@ -24,8 +24,9 @@ inline struct SimulationConfig
     int print_scene_information;
 
     int enable_elastic_band;
-    int band_attached_link = 0;
+    int band_attached_link = -1;
     double sim_dt = 0.0;
+    int sim_control_port = 0;
 
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
     int ghost_ref_enable = 0;
@@ -93,6 +94,7 @@ inline po::variables_map helper(int argc, char** argv)
         ("robot,r", po::value<std::string>(&config.robot), "Robot type; -r go2")
         ("scene,s", po::value<std::filesystem::path>(&config.robot_scene), "Robot scene file; -s scene_terrain.xml")
         ("sim_dt", po::value<double>(&config.sim_dt), "Override MuJoCo timestep after loading XML; --sim_dt 0.001")
+        ("sim_control_port", po::value<int>(&config.sim_control_port), "Local UDP sim-control port; --sim_control_port 8090")
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
         ("ghost_ref_enable", po::value<int>(&config.ghost_ref_enable), "Enable reference ghost viewer; --ghost_ref_enable 1")
         ("ghost_ref_url", po::value<std::string>(&config.ghost_ref_url), "Reference frame endpoint URL")

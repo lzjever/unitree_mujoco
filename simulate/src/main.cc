@@ -18,6 +18,7 @@
 #undef private
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +28,9 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <vector>
 
 #include <mujoco/mujoco.h>
 #include "simulate.h"
@@ -54,6 +57,9 @@ extern "C"
 #include <mach-o/dyld.h>
 #endif
 #include <sys/errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 }
@@ -102,6 +108,15 @@ namespace
   const double syncMisalign = 0.1;       // maximum mis-alignment before re-sync (simulation seconds)
   const double simRefreshFraction = 0.7; // fraction of refresh available for simulation
   const int kErrorLength = 1024;         // load error string length
+  const int kMaxUdpPort = 65535;
+  constexpr std::array<const char*, 6> kElasticBandBodyCandidates = {
+    "head_pitch_link",
+    "head_yaw_link",
+    "torso_link",
+    "base_link",
+    "pelvis_link",
+    "pelvis",
+  };
 
   // model and data
   mjModel *m = nullptr;
@@ -115,8 +130,357 @@ namespace
 
   // control noise variables
   mjtNum *ctrlnoise = nullptr;
+  std::atomic<bool> g_sim_control_stop{false};
 
   using Seconds = std::chrono::duration<double>;
+
+  bool StringContains(const std::string& value, const std::string& needle)
+  {
+    return value.find(needle) != std::string::npos;
+  }
+
+  bool IsValidSimControlPort(int port)
+  {
+    return port >= 1 && port <= kMaxUdpPort;
+  }
+
+  std::string MujocoName(int object_type, int id)
+  {
+    if (!m || id < 0)
+    {
+      return {};
+    }
+    const char* name = mj_id2name(m, object_type, id);
+    return name ? std::string(name) : std::string();
+  }
+
+  bool GeomIsGround(int geom_id)
+  {
+    if (!m || geom_id < 0 || geom_id >= m->ngeom)
+    {
+      return false;
+    }
+    if (m->geom_type[geom_id] == mjGEOM_PLANE)
+    {
+      return true;
+    }
+    const std::string geom_name = MujocoName(mjOBJ_GEOM, geom_id);
+    return StringContains(geom_name, "floor") ||
+           StringContains(geom_name, "ground");
+  }
+
+  bool GeomIsSideFoot(int geom_id, const std::string& side)
+  {
+    if (!m || geom_id < 0 || geom_id >= m->ngeom)
+    {
+      return false;
+    }
+
+    const auto side_foot_name = [&](const std::string& name) {
+      return StringContains(name, side) &&
+             (StringContains(name, "foot") ||
+              StringContains(name, "ankle_roll"));
+    };
+
+    if (side_foot_name(MujocoName(mjOBJ_GEOM, geom_id)))
+    {
+      return true;
+    }
+
+    int body_id = m->geom_bodyid[geom_id];
+    while (body_id >= 0)
+    {
+      if (side_foot_name(MujocoName(mjOBJ_BODY, body_id)))
+      {
+        return true;
+      }
+      if (body_id == 0)
+      {
+        break;
+      }
+      body_id = m->body_parentid[body_id];
+    }
+    return false;
+  }
+
+  struct FootContactStatus
+  {
+    bool left{false};
+    bool right{false};
+  };
+
+  FootContactStatus DetectFootContacts()
+  {
+    FootContactStatus status;
+    if (!m || !d)
+    {
+      return status;
+    }
+
+    for (int i = 0; i < d->ncon; ++i)
+    {
+      const int geom1 = d->contact[i].geom1;
+      const int geom2 = d->contact[i].geom2;
+      const bool geom1_ground = GeomIsGround(geom1);
+      const bool geom2_ground = GeomIsGround(geom2);
+      if (!geom1_ground && !geom2_ground)
+      {
+        continue;
+      }
+
+      const int foot_geom = geom1_ground ? geom2 : geom1;
+      status.left = status.left || GeomIsSideFoot(foot_geom, "left");
+      status.right = status.right || GeomIsSideFoot(foot_geom, "right");
+      if (status.left && status.right)
+      {
+        break;
+      }
+    }
+    return status;
+  }
+
+  void ClearElasticBandForce()
+  {
+    if (!m || !d)
+    {
+      return;
+    }
+    const int base = param::config.band_attached_link;
+    if (base < 0 || base + 2 >= 6 * m->nbody)
+    {
+      return;
+    }
+    d->xfrc_applied[base] = 0.0;
+    d->xfrc_applied[base + 1] = 0.0;
+    d->xfrc_applied[base + 2] = 0.0;
+  }
+
+  bool ElasticBandAttachmentValid()
+  {
+    if (!m || !d)
+    {
+      return false;
+    }
+    const int base = param::config.band_attached_link;
+    return base >= 0 && base + 2 < 6 * m->nbody;
+  }
+
+  bool ElasticBandAvailable()
+  {
+    return param::config.enable_elastic_band == 1 && ElasticBandAttachmentValid();
+  }
+
+  bool ResolveElasticBandAttachment()
+  {
+    if (!m)
+    {
+      param::config.band_attached_link = -1;
+      return false;
+    }
+
+    for (const char* body_name : kElasticBandBodyCandidates)
+    {
+      const int body_id = mj_name2id(m, mjOBJ_BODY, body_name);
+      if (body_id >= 0)
+      {
+        param::config.band_attached_link = 6 * body_id;
+        std::cout << "Elastic band attached to " << body_name << std::endl;
+        return true;
+      }
+    }
+
+    param::config.band_attached_link = -1;
+    if (param::config.enable_elastic_band == 1)
+    {
+      std::cerr << "Elastic band unavailable: no suitable attachment body found." << std::endl;
+    }
+    return false;
+  }
+
+  void AllocateCtrlNoise()
+  {
+    free(ctrlnoise);
+    ctrlnoise = nullptr;
+    if (!m)
+    {
+      return;
+    }
+    ctrlnoise = static_cast<mjtNum*>(malloc(sizeof(mjtNum) * m->nu));
+    if (ctrlnoise)
+    {
+      mju_zero(ctrlnoise, m->nu);
+    }
+  }
+
+  void ReplaceModel(mj::Simulate& sim, mjModel* mnew, mjData* dnew, const char* filename)
+  {
+    sim.Load(mnew, dnew, filename);
+
+    {
+      std::lock_guard<mj::SimulateMutex> lock(sim.mtx);
+      mjData* old_d = d;
+      mjModel* old_m = m;
+
+      m = mnew;
+      d = dnew;
+      mj_forward(m, d);
+      ResolveElasticBandAttachment();
+      AllocateCtrlNoise();
+
+      mj_deleteData(old_d);
+      mj_deleteModel(old_m);
+    }
+  }
+
+  std::string SimControlStatus()
+  {
+    if (!ElasticBandAvailable())
+    {
+      return "ok band_available=0";
+    }
+
+    const FootContactStatus contacts = DetectFootContacts();
+    const int both = contacts.left && contacts.right ? 1 : 0;
+    const double root_z = (m && d && m->nq > 2) ? static_cast<double>(d->qpos[2]) : 0.0;
+    char buffer[256] = {};
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "ok band=%d length=%.3f left_contact=%d right_contact=%d both=%d root_z=%.3f",
+                  elastic_band.enable_ ? 1 : 0,
+                  elastic_band.length_,
+                  contacts.left ? 1 : 0,
+                  contacts.right ? 1 : 0,
+                  both,
+                  root_z);
+    return buffer;
+  }
+
+  std::string HandleSimControlCommand(const std::string& command,
+                                      mj::Simulate* sim)
+  {
+    if (!sim)
+    {
+      return "error sim_unavailable";
+    }
+
+    std::lock_guard<mj::SimulateMutex> lock(sim->mtx);
+    if (command == "hold")
+    {
+      if (!ElasticBandAvailable())
+      {
+        return "error band_unavailable";
+      }
+      elastic_band.enable_ = true;
+      return SimControlStatus();
+    }
+    if (command == "lower")
+    {
+      if (!ElasticBandAvailable())
+      {
+        return "error band_unavailable";
+      }
+      elastic_band.enable_ = true;
+      elastic_band.length_ += 0.1;
+      return SimControlStatus();
+    }
+    if (command == "lift")
+    {
+      if (!ElasticBandAvailable())
+      {
+        return "error band_unavailable";
+      }
+      elastic_band.enable_ = true;
+      elastic_band.length_ -= 0.1;
+      return SimControlStatus();
+    }
+    if (command == "release")
+    {
+      elastic_band.enable_ = false;
+      elastic_band.f_ = {0.0, 0.0, 0.0};
+      ClearElasticBandForce();
+      return SimControlStatus();
+    }
+    if (command == "status")
+    {
+      return SimControlStatus();
+    }
+    return "error unknown_command";
+  }
+
+  int OpenSimControlSocket(int port)
+  {
+    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+    {
+      std::cerr << "Failed to start MuJoCo sim-control on 127.0.0.1:"
+                << port << ": socket: " << std::strerror(errno) << std::endl;
+      return -1;
+    }
+
+    timeval timeout {};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 200000;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+      std::cerr << "Failed to start MuJoCo sim-control on 127.0.0.1:"
+                << port << ": setsockopt(SO_RCVTIMEO): " << std::strerror(errno)
+                << std::endl;
+      close(sock);
+      return -1;
+    }
+
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+    {
+      std::cerr << "Failed to start MuJoCo sim-control on 127.0.0.1:"
+                << port << ": bind: " << std::strerror(errno) << std::endl;
+      close(sock);
+      return -1;
+    }
+
+    return sock;
+  }
+
+  void SimControlThread(int sock, mj::Simulate* sim)
+  {
+    while (!g_sim_control_stop.load())
+    {
+      char buffer[128] = {};
+      sockaddr_in client {};
+      socklen_t client_len = sizeof(client);
+      const ssize_t n = recvfrom(sock,
+                                 buffer,
+                                 sizeof(buffer) - 1,
+                                 0,
+                                 reinterpret_cast<sockaddr*>(&client),
+                                 &client_len);
+      if (n <= 0)
+      {
+        continue;
+      }
+
+      std::string command(buffer, static_cast<std::size_t>(n));
+      while (!command.empty() &&
+             (command.back() == '\n' || command.back() == '\r' ||
+              command.back() == ' ' || command.back() == '\t'))
+      {
+        command.pop_back();
+      }
+
+      const std::string response = HandleSimControlCommand(command, sim);
+      sendto(sock,
+             response.c_str(),
+             response.size(),
+             0,
+             reinterpret_cast<sockaddr*>(&client),
+             client_len);
+    }
+
+    close(sock);
+  }
 
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
   bool CopyLivePelvisPose(std::array<double, 3>* pos, std::array<double, 4>* quat)
@@ -459,22 +823,11 @@ namespace
           dnew = mj_makeData(mnew);
         if (dnew)
         {
-          sim.Load(mnew, dnew, sim.dropfilename);
-
-          mj_deleteData(d);
-          mj_deleteModel(m);
-
-          m = mnew;
-          d = dnew;
-          mj_forward(m, d);
-
-          // allocate ctrlnoise
-          free(ctrlnoise);
-          ctrlnoise = (mjtNum *)malloc(sizeof(mjtNum) * m->nu);
-          mju_zero(ctrlnoise, m->nu);
+          ReplaceModel(sim, mnew, dnew, sim.dropfilename);
         }
         else
         {
+          mj_deleteModel(mnew);
           sim.LoadMessageClear();
         }
       }
@@ -489,22 +842,11 @@ namespace
           dnew = mj_makeData(mnew);
         if (dnew)
         {
-          sim.Load(mnew, dnew, sim.filename);
-
-          mj_deleteData(d);
-          mj_deleteModel(m);
-
-          m = mnew;
-          d = dnew;
-          mj_forward(m, d);
-
-          // allocate ctrlnoise
-          free(ctrlnoise);
-          ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
-          mju_zero(ctrlnoise, m->nu);
+          ReplaceModel(sim, mnew, dnew, sim.filename);
         }
         else
         {
+          mj_deleteModel(mnew);
           sim.LoadMessageClear();
         }
       }
@@ -598,7 +940,7 @@ namespace
                 }
 
                 // elastic band on base link
-                if (param::config.enable_elastic_band == 1)
+                if (ElasticBandAvailable())
                 {
                   if (elastic_band.enable_)
                   {
@@ -610,6 +952,10 @@ namespace
                     d->xfrc_applied[param::config.band_attached_link] = elastic_band.f_[0];
                     d->xfrc_applied[param::config.band_attached_link + 1] = elastic_band.f_[1];
                     d->xfrc_applied[param::config.band_attached_link + 2] = elastic_band.f_[2];
+                  }
+                  else
+                  {
+                    ClearElasticBandForce();
                   }
                 }
 
@@ -653,21 +999,17 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
   if (filename != nullptr)
   {
     sim->LoadMessage(filename);
-    m = LoadModel(filename, *sim);
-    if (m)
-      d = mj_makeData(m);
-    if (d)
+    mjModel* mnew = LoadModel(filename, *sim);
+    mjData* dnew = nullptr;
+    if (mnew)
+      dnew = mj_makeData(mnew);
+    if (dnew)
     {
-      sim->Load(m, d, filename);
-      mj_forward(m, d);
-
-      // allocate ctrlnoise
-      free(ctrlnoise);
-      ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
-      mju_zero(ctrlnoise, m->nu);
+      ReplaceModel(*sim, mnew, dnew, filename);
     }
     else
     {
+      mj_deleteModel(mnew);
       sim->LoadMessageClear();
     }
   }
@@ -675,15 +1017,24 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
   PhysicsLoop(*sim);
 
   // delete everything we allocated
-  free(ctrlnoise);
-  mj_deleteData(d);
-  mj_deleteModel(m);
+  {
+    std::lock_guard<mj::SimulateMutex> lock(sim->mtx);
+    free(ctrlnoise);
+    ctrlnoise = nullptr;
+    mj_deleteData(d);
+    mj_deleteModel(m);
+    d = nullptr;
+    m = nullptr;
+    param::config.band_attached_link = -1;
+  }
 
   exit(0);
 }
 
 void *UnitreeSdk2BridgeThread(void *arg)
 {
+  (void)arg;
+
   // Wait for mujoco data
   while (true)
   {
@@ -696,30 +1047,6 @@ void *UnitreeSdk2BridgeThread(void *arg)
   }
 
   unitree::robot::ChannelFactory::Instance()->Init(param::config.domain_id, param::config.interface);
-
-
-  int body_id = -1;
-  const std::vector<std::string> band_body_candidates = {
-    "head_pitch_link",
-    "head_yaw_link",
-    "torso_link",
-    "base_link",
-    "pelvis_link",
-    "pelvis",
-  };
-  for (const auto& body_name : band_body_candidates) {
-    body_id = mj_name2id(m, mjOBJ_BODY, body_name.c_str());
-    if (body_id >= 0) {
-      std::cout << "Elastic band attached to " << body_name << std::endl;
-      break;
-    }
-  }
-  if (body_id >= 0) {
-    param::config.band_attached_link = 6 * body_id;
-  } else if (param::config.enable_elastic_band == 1) {
-    std::cerr << "Elastic band disabled: no suitable attachment body found." << std::endl;
-    param::config.enable_elastic_band = 0;
-  }
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
   if (param::config.robot == "r1" || param::config.robot == "et1_v1" || param::config.robot == "tdf_ET1") {
@@ -831,14 +1158,53 @@ int main(int argc, char **argv)
 #else
   (void)cli;
 #endif
+  if ((cli.count("sim_control_port") > 0 || param::config.sim_control_port != 0) &&
+      !IsValidSimControlPort(param::config.sim_control_port))
+  {
+    std::cerr << "Invalid --sim_control_port " << param::config.sim_control_port
+              << ": expected 1.." << kMaxUdpPort << " when sim-control is enabled."
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+
   if(param::config.robot_scene.is_relative()) {
     param::config.robot_scene = proj_dir.parent_path() / "unitree_robots" / param::config.robot / param::config.robot_scene;
+  }
+
+  int sim_control_sock = -1;
+  if (IsValidSimControlPort(param::config.sim_control_port))
+  {
+    sim_control_sock = OpenSimControlSocket(param::config.sim_control_port);
+    if (sim_control_sock < 0)
+    {
+      return EXIT_FAILURE;
+    }
   }
 
   // simulate object encapsulates the UI
   auto sim = std::make_unique<mj::Simulate>(
     std::make_unique<mj::GlfwAdapter>(),
     &cam, &opt, &pert, /* is_passive = */ false);
+
+  std::thread sim_control_thread;
+  if (sim_control_sock >= 0)
+  {
+    g_sim_control_stop.store(false);
+    try
+    {
+      sim_control_thread = std::thread(SimControlThread, sim_control_sock, sim.get());
+      sim_control_sock = -1;
+    }
+    catch (const std::system_error& e)
+    {
+      std::cerr << "Failed to start MuJoCo sim-control thread: " << e.what()
+                << std::endl;
+      close(sim_control_sock);
+      return EXIT_FAILURE;
+    }
+    std::cout << "MuJoCo sim-control listening on 127.0.0.1:"
+              << param::config.sim_control_port << std::endl;
+  }
 
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
   agentic_ref::ReferenceFrameCache ghost_cache;
@@ -873,6 +1239,11 @@ int main(int argc, char **argv)
   // start simulation UI loop (blocking call)
   glfwSetKeyCallback(static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_,user_key_cb);
   sim->RenderLoop();
+  g_sim_control_stop.store(true);
+  if (sim_control_thread.joinable())
+  {
+    sim_control_thread.join();
+  }
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
   if (ghost_client)
   {
