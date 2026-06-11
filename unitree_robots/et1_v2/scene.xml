@@ -1,5 +1,5 @@
-<mujoco model="tdf_ET1 scene">
-  <include file="ET1_collision_foot_mesh.xml"/>
+<mujoco model="et1_v2 scene">
+  <include file="et1_v2_collision_foot_mesh.xml"/>
 
   <statistic center="1.0 0.7 1.0" extent="0.8"/>
 

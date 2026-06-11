@@ -1,5 +1,5 @@
-robot: "tdf_ET1"  # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1", "r1", "et1_v1", "tdf_ET1"
-robot_scene: "scene_foot_mesh_carpet.xml" # Robot scene, /unitree_robots/[robot]/scene.xml 
+robot: "et1_v2"  # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1", "r1", "et1_v1", "et1_v2"
+robot_scene: "scene.xml" # Robot scene, /unitree_robots/[robot]/scene.xml
 
 domain_id: 0  # Domain id
 interface: "lo" # Interface 
@@ -12,5 +12,7 @@ joystick_bits: 16 # Some game controllers may only have 8-bit accuracy
 print_scene_information: 1 # Print link, joint and sensors information of robot
 
 enable_elastic_band: 1 # Virtual spring band, used for lifting h1
+sim_control_port: 8090 # Local UDP interface used by unitree_rl_lab --sim-auto
+sim_control_band_step: 0.1 # Same effect as one manual "8" key press
 
 sim_dt: 0.001  # Override MuJoCo physics timestep after loading XML

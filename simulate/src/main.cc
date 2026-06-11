@@ -17,6 +17,7 @@
 #include "glfw_adapter.h"
 #undef private
 
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -380,7 +382,7 @@ namespace
         return "error band_unavailable";
       }
       elastic_band.enable_ = true;
-      elastic_band.length_ += 0.1;
+      elastic_band.length_ += param::config.sim_control_band_step;
       return SimControlStatus();
     }
     if (command == "lift")
@@ -1049,7 +1051,7 @@ void *UnitreeSdk2BridgeThread(void *arg)
   unitree::robot::ChannelFactory::Instance()->Init(param::config.domain_id, param::config.interface);
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
-  if (param::config.robot == "r1" || param::config.robot == "et1_v1" || param::config.robot == "tdf_ET1") {
+  if (param::config.robot == "r1" || param::config.robot == "et1_v1" || param::config.robot == "et1_v2") {
     interface = std::make_unique<R1Bridge>(m, d);
   } else if (m->nu > NUM_MOTOR_IDL_GO) {
     interface = std::make_unique<G1Bridge>(m, d);

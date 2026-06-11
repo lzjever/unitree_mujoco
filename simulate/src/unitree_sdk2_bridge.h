@@ -341,7 +341,7 @@ private:
         15, 16, 17, 18, 19,
         22, 23, 24, 25, 26
     };
-    static constexpr std::array<int, kR1MotorCount> kTdfET1JointIdxInIdl = {
+    static constexpr std::array<int, kR1MotorCount> kEt1V2JointIdxInIdl = {
         0, 1, 2, 3, 4, 5,
         6, 7, 8, 9, 10, 11,
         12, 13,
@@ -355,8 +355,8 @@ private:
         if (param::config.robot == "et1_v1") {
             return kEt1V1JointIdxInIdl[motor_index];
         }
-        if (param::config.robot == "tdf_ET1") {
-            return kTdfET1JointIdxInIdl[motor_index];
+        if (param::config.robot == "et1_v2") {
+            return kEt1V2JointIdxInIdl[motor_index];
         }
         return kR1JointIdxInIdl[motor_index];
     }

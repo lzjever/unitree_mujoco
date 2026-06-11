@@ -1,5 +1,5 @@
 <mujoco model="galbot et1 foot mesh carpet scene">
-  <include file="ET1_collision_foot_mesh.xml"/>
+  <include file="et1_v2_collision_foot_mesh.xml"/>
 
   <statistic center="1.0 0.7 1.0" extent="0.8"/>
 
