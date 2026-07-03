@@ -123,6 +123,7 @@ namespace
   // model and data
   mjModel *m = nullptr;
   mjData *d = nullptr;
+  mjvCamera* g_camera = nullptr;
 
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
   agentic_ref::ReferenceFrameCache* g_ghost_cache = nullptr;
@@ -314,6 +315,118 @@ namespace
     }
   }
 
+  int ResolveCameraTrackBody()
+  {
+    if (!m)
+    {
+      return -1;
+    }
+
+    if (!param::config.camera_track_body.empty())
+    {
+      const int id = mj_name2id(m, mjOBJ_BODY, param::config.camera_track_body.c_str());
+      if (id >= 0)
+      {
+        return id;
+      }
+      std::cerr << "Camera track body not found: "
+                << param::config.camera_track_body << "; using fallback."
+                << std::endl;
+    }
+
+    constexpr std::array<const char*, 5> kCameraBodyFallbacks = {
+      "pelvis_link",
+      "torso_link",
+      "base_link",
+      "pelvis",
+      "trunk"
+    };
+    for (const char* name : kCameraBodyFallbacks)
+    {
+      const int id = mj_name2id(m, mjOBJ_BODY, name);
+      if (id >= 0)
+      {
+        return id;
+      }
+    }
+    return m->nbody > 1 ? 1 : 0;
+  }
+
+  bool ConfigureTrackingCamera(bool force = false)
+  {
+    if (!g_camera || !m || !d || (!force && param::config.camera_track_enable == 0))
+    {
+      return false;
+    }
+
+    const int body_id = ResolveCameraTrackBody();
+    if (body_id < 0)
+    {
+      return false;
+    }
+
+    g_camera->type = mjCAMERA_TRACKING;
+    g_camera->trackbodyid = body_id;
+    g_camera->distance = std::isfinite(param::config.camera_distance)
+                         ? std::max(1.0, param::config.camera_distance)
+                         : 4.2;
+    g_camera->azimuth = std::isfinite(param::config.camera_azimuth)
+                        ? param::config.camera_azimuth
+                        : 240.0;
+    g_camera->elevation = std::isfinite(param::config.camera_elevation)
+                          ? param::config.camera_elevation
+                          : -18.0;
+    g_camera->lookat[0] = d->xpos[3 * body_id + 0];
+    g_camera->lookat[1] = d->xpos[3 * body_id + 1];
+    g_camera->lookat[2] = d->xpos[3 * body_id + 2] +
+                          (std::isfinite(param::config.camera_lookat_height)
+                           ? param::config.camera_lookat_height
+                           : 0.75);
+
+    std::cout << "Tracking camera: body=" << MujocoName(mjOBJ_BODY, body_id)
+              << " distance=" << g_camera->distance
+              << " azimuth=" << g_camera->azimuth
+              << " elevation=" << g_camera->elevation
+              << " lookat_height=" << param::config.camera_lookat_height
+              << std::endl;
+    return true;
+  }
+
+  const char* CameraTypeName()
+  {
+    if (!g_camera)
+    {
+      return "unknown";
+    }
+    switch (g_camera->type)
+    {
+      case mjCAMERA_TRACKING:
+        return "tracking";
+      case mjCAMERA_FREE:
+        return "free";
+      case mjCAMERA_FIXED:
+        return "fixed";
+      default:
+        return "unknown";
+    }
+  }
+
+  int CameraTrackBodyId()
+  {
+    return g_camera ? g_camera->trackbodyid : -1;
+  }
+
+  std::string CameraTrackBodyName()
+  {
+    const int body_id = CameraTrackBodyId();
+    if (!m || body_id < 0 || body_id >= m->nbody)
+    {
+      return "unknown";
+    }
+    const std::string name = MujocoName(mjOBJ_BODY, body_id);
+    return name.empty() ? std::string("unknown") : name;
+  }
+
   void ReplaceModel(mj::Simulate& sim, mjModel* mnew, mjData* dnew, const char* filename)
   {
     sim.Load(mnew, dnew, filename);
@@ -328,6 +441,7 @@ namespace
       mj_forward(m, d);
       ResolveElasticBandAttachment();
       AllocateCtrlNoise();
+      ConfigureTrackingCamera();
 
       mj_deleteData(old_d);
       mj_deleteModel(old_m);
@@ -336,25 +450,36 @@ namespace
 
   std::string SimControlStatus()
   {
-    if (!ElasticBandAvailable())
+    std::ostringstream status;
+    status.setf(std::ios::fixed);
+    status.precision(3);
+    status << "ok";
+
+    if (ElasticBandAvailable())
     {
-      return "ok band_available=0";
+      const FootContactStatus contacts = DetectFootContacts();
+      const int both = contacts.left && contacts.right ? 1 : 0;
+      status << " band=" << (elastic_band.enable_ ? 1 : 0)
+             << " length=" << elastic_band.length_
+             << " left_contact=" << (contacts.left ? 1 : 0)
+             << " right_contact=" << (contacts.right ? 1 : 0)
+             << " both=" << both;
+    }
+    else
+    {
+      status << " band_available=0";
     }
 
-    const FootContactStatus contacts = DetectFootContacts();
-    const int both = contacts.left && contacts.right ? 1 : 0;
+    const double root_x = (m && d && m->nq > 0) ? static_cast<double>(d->qpos[0]) : 0.0;
+    const double root_y = (m && d && m->nq > 1) ? static_cast<double>(d->qpos[1]) : 0.0;
     const double root_z = (m && d && m->nq > 2) ? static_cast<double>(d->qpos[2]) : 0.0;
-    char buffer[256] = {};
-    std::snprintf(buffer,
-                  sizeof(buffer),
-                  "ok band=%d length=%.3f left_contact=%d right_contact=%d both=%d root_z=%.3f",
-                  elastic_band.enable_ ? 1 : 0,
-                  elastic_band.length_,
-                  contacts.left ? 1 : 0,
-                  contacts.right ? 1 : 0,
-                  both,
-                  root_z);
-    return buffer;
+    status << " root_x=" << root_x
+           << " root_y=" << root_y
+           << " root_z=" << root_z
+           << " camera_type=" << CameraTypeName()
+           << " camera_track_body=" << CameraTrackBodyName()
+           << " camera_trackbodyid=" << CameraTrackBodyId();
+    return status.str();
   }
 
   std::string HandleSimControlCommand(const std::string& command,
@@ -404,6 +529,15 @@ namespace
     }
     if (command == "status")
     {
+      return SimControlStatus();
+    }
+    if (command == "camera_align")
+    {
+      if (ConfigureTrackingCamera(true))
+      {
+        sim->camera = 1;
+        sim->pending_.ui_update_rendering = true;
+      }
       return SimControlStatus();
     }
     return "error unknown_command";
@@ -1135,6 +1269,7 @@ int main(int argc, char **argv)
 
   mjvCamera cam;
   mjv_defaultCamera(&cam);
+  g_camera = &cam;
 
   mjvOption opt;
   mjv_defaultOption(&opt);

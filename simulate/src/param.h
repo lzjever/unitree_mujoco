@@ -37,6 +37,13 @@ inline struct SimulationConfig
     int ghost_ref_stale_ms = 250;
 #endif
 
+    int camera_track_enable = 1;
+    std::string camera_track_body = "pelvis_link";
+    double camera_distance = 4.2;
+    double camera_azimuth = 240.0;
+    double camera_elevation = -18.0;
+    double camera_lookat_height = 0.75;
+
     void load_from_yaml(const std::string &filename)
     {
         auto cfg = YAML::LoadFile(filename);
@@ -60,6 +67,24 @@ inline struct SimulationConfig
             }
             if (cfg["sim_dt"]) {
                 sim_dt = cfg["sim_dt"].as<double>();
+            }
+            if (cfg["camera_track_enable"]) {
+                camera_track_enable = cfg["camera_track_enable"].as<int>();
+            }
+            if (cfg["camera_track_body"]) {
+                camera_track_body = cfg["camera_track_body"].as<std::string>();
+            }
+            if (cfg["camera_distance"]) {
+                camera_distance = cfg["camera_distance"].as<double>();
+            }
+            if (cfg["camera_azimuth"]) {
+                camera_azimuth = cfg["camera_azimuth"].as<double>();
+            }
+            if (cfg["camera_elevation"]) {
+                camera_elevation = cfg["camera_elevation"].as<double>();
+            }
+            if (cfg["camera_lookat_height"]) {
+                camera_lookat_height = cfg["camera_lookat_height"].as<double>();
             }
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
             if (cfg["ghost_ref_enable"]) {
@@ -102,6 +127,12 @@ inline po::variables_map helper(int argc, char** argv)
         ("scene,s", po::value<std::filesystem::path>(&config.robot_scene), "Robot scene file; -s scene_terrain.xml")
         ("sim_dt", po::value<double>(&config.sim_dt), "Override MuJoCo timestep after loading XML; --sim_dt 0.001")
         ("sim_control_port", po::value<int>(&config.sim_control_port), "Local UDP sim-control port, 0 disables it; --sim_control_port 8090")
+        ("camera_track_enable", po::value<int>(&config.camera_track_enable), "Enable tracking camera centered on robot; --camera_track_enable 1")
+        ("camera_track_body", po::value<std::string>(&config.camera_track_body), "Body name for tracking camera; --camera_track_body pelvis_link")
+        ("camera_distance", po::value<double>(&config.camera_distance), "Tracking camera distance in meters")
+        ("camera_azimuth", po::value<double>(&config.camera_azimuth), "Tracking camera azimuth in degrees")
+        ("camera_elevation", po::value<double>(&config.camera_elevation), "Tracking camera elevation in degrees")
+        ("camera_lookat_height", po::value<double>(&config.camera_lookat_height), "Tracking camera vertical look-at offset in meters")
 #ifdef UNITREE_MUJOCO_GHOST_VIEWER
         ("ghost_ref_enable", po::value<int>(&config.ghost_ref_enable), "Enable reference ghost viewer; --ghost_ref_enable 1")
         ("ghost_ref_url", po::value<std::string>(&config.ghost_ref_url), "Reference frame endpoint URL")
